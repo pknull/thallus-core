@@ -1,0 +1,26 @@
+[package]
+name = "thallus-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Louis Grenzebach <pk@zalgo.net>"]
+description = "Shared core library for the Thallus decentralized AI infrastructure"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+base64 = "0.22"
+tracing = "0.1"
+thiserror = "1"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+jsonschema = "0.18"
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
