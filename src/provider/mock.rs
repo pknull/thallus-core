@@ -79,6 +79,7 @@ impl Provider for MockProvider {
                 usage: Usage {
                     input_tokens: 50,
                     output_tokens: 25,
+                    ..Default::default()
                 },
             })
         } else {
@@ -90,6 +91,7 @@ impl Provider for MockProvider {
                 usage: Usage {
                     input_tokens: 50,
                     output_tokens: 25,
+                    ..Default::default()
                 },
             })
         }
@@ -108,6 +110,9 @@ mod tests {
             base_url: Some(response.to_string()),
             max_tokens: None,
             temperature: None,
+            max_retries: None,
+            initial_backoff_ms: None,
+            max_backoff_ms: None,
         }
     }
 
@@ -131,6 +136,9 @@ mod tests {
             base_url: None,
             max_tokens: None,
             temperature: None,
+            max_retries: None,
+            initial_backoff_ms: None,
+            max_backoff_ms: None,
         };
         let provider = MockProvider::new(&config).unwrap();
         let response = provider

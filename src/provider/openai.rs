@@ -1,10 +1,13 @@
 //! OpenAI-compatible provider (works with OpenAI, Ollama, vLLM, etc.)
 
 use async_trait::async_trait;
+use futures::StreamExt;
+use reqwest_eventsource::{Event, RequestBuilderExt};
 
 use super::{
+    retry::{is_retryable_error, is_retryable_status, RetryPolicy},
     truncate_error_body, ChatResponse, ContentBlock, Message, Provider, ProviderCapabilities, Role,
-    StopReason, Usage,
+    StopReason, StreamCallback, StreamEvent, Usage,
 };
 use crate::config::LlmConfig;
 use crate::error::{CoreError, Result};
@@ -17,6 +20,7 @@ pub struct OpenAiCompatProvider {
     api_key: Option<String>,
     model: String,
     max_tokens: u32,
+    retry_policy: RetryPolicy,
 }
 
 impl OpenAiCompatProvider {
@@ -51,7 +55,268 @@ impl OpenAiCompatProvider {
             api_key,
             model: config.model.clone(),
             max_tokens: config.max_tokens.unwrap_or(4096),
+            retry_policy: RetryPolicy::from_config(config),
         })
+    }
+}
+
+impl OpenAiCompatProvider {
+    /// Send a request with retry on transient failures.
+    async fn send_with_retry(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let mut last_error: Option<CoreError> = None;
+
+        for attempt in 0..=self.retry_policy.max_retries {
+            if attempt > 0 {
+                let backoff = self.retry_policy.backoff_for_attempt(attempt);
+                tracing::warn!(
+                    attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "retrying openai-compat request"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+
+            let mut request = self.client.post(url).json(body);
+            if let Some(ref api_key) = self.api_key {
+                request = request.header("Authorization", format!("Bearer {}", api_key));
+            }
+
+            let result = request.send().await;
+
+            let response = match result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if is_retryable_error(&e) && attempt < self.retry_policy.max_retries {
+                        tracing::warn!(
+                            attempt,
+                            error = %e,
+                            "transient request error, will retry"
+                        );
+                        last_error = Some(CoreError::Provider {
+                            reason: format!("request failed: {}", e),
+                        });
+                        continue;
+                    }
+                    return Err(CoreError::Provider {
+                        reason: format!("request failed: {}", e),
+                    });
+                }
+            };
+
+            let status = response.status();
+
+            if status.is_success() {
+                return response.json().await.map_err(|e| CoreError::Provider {
+                    reason: format!("failed to parse response: {}", e),
+                });
+            }
+
+            let status_code = status.as_u16();
+            let body_text = response.text().await.unwrap_or_default();
+
+            if is_retryable_status(status_code) && attempt < self.retry_policy.max_retries {
+                tracing::warn!(
+                    attempt,
+                    status = status_code,
+                    "retryable API error"
+                );
+                last_error = Some(CoreError::Provider {
+                    reason: format!("API error {}: {}", status, truncate_error_body(&body_text)),
+                });
+                continue;
+            }
+
+            return Err(CoreError::Provider {
+                reason: format!("API error {}: {}", status, truncate_error_body(&body_text)),
+            });
+        }
+
+        Err(last_error.unwrap_or_else(|| CoreError::Provider {
+            reason: "retries exhausted".into(),
+        }))
+    }
+
+    /// Build the OpenAI-format request body.
+    fn build_body(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[LlmTool],
+        stream: bool,
+    ) -> serde_json::Value {
+        let mut openai_messages: Vec<serde_json::Value> = vec![serde_json::json!({
+            "role": "system",
+            "content": system
+        })];
+
+        for msg in messages {
+            let converted = convert_message_to_openai(msg);
+            openai_messages.extend(converted);
+        }
+
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": openai_messages,
+        });
+
+        if stream {
+            body["stream"] = serde_json::Value::Bool(true);
+            // Required to receive usage in streaming responses
+            body["stream_options"] = serde_json::json!({"include_usage": true});
+        }
+
+        if !tools.is_empty() {
+            let openai_tools: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema,
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::Value::Array(openai_tools);
+        }
+
+        body
+    }
+
+    /// Process an SSE stream from an OpenAI-compatible API.
+    async fn process_stream(
+        &self,
+        body: serde_json::Value,
+        on_event: &StreamCallback,
+    ) -> Result<ChatResponse> {
+        let url = format!("{}/chat/completions", self.base_url);
+
+        let mut request = self.client.post(&url).json(&body);
+        if let Some(ref api_key) = self.api_key {
+            request = request.header("Authorization", format!("Bearer {}", api_key));
+        }
+
+        let mut es = request.eventsource().map_err(|e| CoreError::Provider {
+            reason: format!("failed to create event source: {}", e),
+        })?;
+
+        let mut text_content = String::new();
+        // tool_calls: indexed by position, each holds (id, name, arguments_json)
+        let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+        let mut stop_reason = StopReason::EndTurn;
+        let mut usage = Usage::default();
+
+        while let Some(event) = es.next().await {
+            match event {
+                Ok(Event::Open) => {}
+                Ok(Event::Message(msg)) => {
+                    if msg.data == "[DONE]" {
+                        es.close();
+                        break;
+                    }
+
+                    let data: serde_json::Value = match serde_json::from_str(&msg.data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    // Usage appears in the final chunk (with stream_options.include_usage)
+                    if !data["usage"].is_null() {
+                        usage = parse_openai_usage(&data["usage"]);
+                    }
+
+                    let choice = &data["choices"][0];
+                    let delta = &choice["delta"];
+
+                    // Text delta
+                    if let Some(text) = delta["content"].as_str() {
+                        if !text.is_empty() {
+                            text_content.push_str(text);
+                            on_event(StreamEvent::TextDelta(text.to_string()));
+                        }
+                    }
+
+                    // Tool call deltas
+                    if let Some(tc_array) = delta["tool_calls"].as_array() {
+                        for tc in tc_array {
+                            let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+
+                            // Extend vector if needed
+                            while tool_calls.len() <= idx {
+                                tool_calls.push((String::new(), String::new(), String::new()));
+                            }
+
+                            // Initial chunk contains id and function name
+                            if let Some(id) = tc["id"].as_str() {
+                                tool_calls[idx].0 = id.to_string();
+                            }
+                            if let Some(name) = tc["function"]["name"].as_str() {
+                                tool_calls[idx].1 = name.to_string();
+                                on_event(StreamEvent::ToolUseStart {
+                                    id: tool_calls[idx].0.clone(),
+                                    name: name.to_string(),
+                                });
+                            }
+
+                            // Argument fragments
+                            if let Some(args) = tc["function"]["arguments"].as_str() {
+                                tool_calls[idx].2.push_str(args);
+                                on_event(StreamEvent::ToolInputDelta {
+                                    id: tool_calls[idx].0.clone(),
+                                    json_chunk: args.to_string(),
+                                });
+                            }
+                        }
+                    }
+
+                    // Finish reason
+                    if let Some(fr) = choice["finish_reason"].as_str() {
+                        stop_reason = match fr {
+                            "stop" => StopReason::EndTurn,
+                            "tool_calls" => StopReason::ToolUse,
+                            "length" => StopReason::MaxTokens,
+                            _ => StopReason::EndTurn,
+                        };
+                    }
+                }
+                Err(reqwest_eventsource::Error::StreamEnded) => break,
+                Err(e) => {
+                    es.close();
+                    return Err(CoreError::Provider {
+                        reason: format!("SSE stream error: {}", e),
+                    });
+                }
+            }
+        }
+
+        // Build final content blocks
+        let mut content = Vec::new();
+        if !text_content.is_empty() {
+            content.push(ContentBlock::text(&text_content));
+        }
+        for (id, name, args_json) in &tool_calls {
+            if !name.is_empty() {
+                let arguments: serde_json::Value = serde_json::from_str(args_json)
+                    .unwrap_or(serde_json::json!({}));
+                content.push(ContentBlock::tool_use(id, name, arguments));
+            }
+        }
+
+        let response = ChatResponse {
+            content,
+            stop_reason,
+            usage,
+        };
+
+        on_event(StreamEvent::Done(response.clone()));
+        Ok(response)
     }
 }
 
@@ -77,78 +342,20 @@ impl Provider for OpenAiCompatProvider {
         tools: &[LlmTool],
     ) -> Result<ChatResponse> {
         let url = format!("{}/chat/completions", self.base_url);
+        let body = self.build_body(system, messages, tools, false);
+        let response_body = self.send_with_retry(&url, &body).await?;
 
-        // Convert messages to OpenAI format
-        let mut openai_messages: Vec<serde_json::Value> = vec![serde_json::json!({
-            "role": "system",
-            "content": system
-        })];
-
-        for msg in messages {
-            let converted = convert_message_to_openai(msg);
-            openai_messages.extend(converted);
-        }
-
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "messages": openai_messages,
-        });
-
-        if !tools.is_empty() {
-            let openai_tools: Vec<serde_json::Value> = tools
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.input_schema,
-                        }
-                    })
-                })
-                .collect();
-            body["tools"] = serde_json::Value::Array(openai_tools);
-        }
-
-        let mut request = self.client.post(&url).json(&body);
-
-        if let Some(ref api_key) = self.api_key {
-            request = request.header("Authorization", format!("Bearer {}", api_key));
-        }
-
-        let response = request.send().await.map_err(|e| CoreError::Provider {
-            reason: format!("request failed: {}", e),
-        })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(CoreError::Provider {
-                reason: format!("API error {}: {}", status, truncate_error_body(&body)),
-            });
-        }
-
-        let response_body: serde_json::Value =
-            response.json().await.map_err(|e| CoreError::Provider {
-                reason: format!("failed to parse response: {}", e),
-            })?;
-
-        // Parse OpenAI response
         let choice = &response_body["choices"][0];
         let message = &choice["message"];
 
         let mut content = Vec::new();
 
-        // Text content
         if let Some(text) = message["content"].as_str() {
             if !text.is_empty() {
                 content.push(ContentBlock::text(text));
             }
         }
 
-        // Tool calls
         if let Some(tool_calls) = message["tool_calls"].as_array() {
             for call in tool_calls {
                 let id = call["id"].as_str().unwrap_or("").to_string();
@@ -168,20 +375,24 @@ impl Provider for OpenAiCompatProvider {
             _ => StopReason::EndTurn,
         };
 
-        let usage = Usage {
-            input_tokens: response_body["usage"]["prompt_tokens"]
-                .as_u64()
-                .unwrap_or(0) as u32,
-            output_tokens: response_body["usage"]["completion_tokens"]
-                .as_u64()
-                .unwrap_or(0) as u32,
-        };
+        let usage = parse_openai_usage(&response_body["usage"]);
 
         Ok(ChatResponse {
             content,
             stop_reason,
             usage,
         })
+    }
+
+    async fn chat_stream(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[LlmTool],
+        on_event: &StreamCallback,
+    ) -> Result<ChatResponse> {
+        let body = self.build_body(system, messages, tools, true);
+        self.process_stream(body, on_event).await
     }
 }
 
@@ -190,6 +401,30 @@ impl Provider for OpenAiCompatProvider {
 /// OpenAI format differences from Anthropic:
 /// - Assistant tool calls go in `tool_calls` array on the message
 /// - Tool results are separate messages with `role: "tool"` and `tool_call_id`
+/// Parse OpenAI usage object into canonical TokenUsage.
+///
+/// OpenAI's `prompt_tokens` INCLUDES cached tokens (unlike Anthropic).
+/// Uncached input = prompt_tokens - cached_tokens.
+/// `prompt_tokens_details` and `completion_tokens_details` may be absent
+/// on OpenAI-compatible backends (Ollama, vLLM, Groq).
+fn parse_openai_usage(usage: &serde_json::Value) -> Usage {
+    let prompt_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+    let cached_tokens = usage["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or(0) as u32;
+    let reasoning_tokens = usage["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap_or(0) as u32;
+
+    Usage {
+        input_tokens: prompt_tokens.saturating_sub(cached_tokens),
+        output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
+        cache_read_tokens: cached_tokens,
+        cache_write_tokens: 0, // OpenAI caching has no write premium
+        reasoning_tokens,
+    }
+}
+
 fn convert_message_to_openai(msg: &Message) -> Vec<serde_json::Value> {
     let role = match msg.role {
         Role::User => "user",

@@ -39,4 +39,13 @@ pub struct LlmConfig {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Maximum number of retries on transient failures (default: 2).
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    /// Initial backoff delay in milliseconds (default: 200).
+    #[serde(default)]
+    pub initial_backoff_ms: Option<u64>,
+    /// Maximum backoff delay in milliseconds (default: 2000).
+    #[serde(default)]
+    pub max_backoff_ms: Option<u64>,
 }

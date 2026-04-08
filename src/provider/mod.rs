@@ -6,6 +6,9 @@ mod anthropic;
 mod claude_cli;
 pub mod mock;
 mod openai;
+pub mod cache;
+pub mod pricing;
+pub mod retry;
 
 pub use anthropic::AnthropicProvider;
 pub use claude_cli::ClaudeCodeProvider;
@@ -194,11 +197,63 @@ impl ChatResponse {
 }
 
 /// Token usage statistics.
+///
+/// Canonical representation across all providers. Each provider maps its
+/// response format into these fields:
+///
+/// - **Anthropic**: `input_tokens` = uncached only, `cache_write_tokens` =
+///   `cache_creation_input_tokens`, `cache_read_tokens` = `cache_read_input_tokens`
+/// - **OpenAI**: `input_tokens` = `prompt_tokens - cached_tokens`,
+///   `cache_read_tokens` = `prompt_tokens_details.cached_tokens`,
+///   `reasoning_tokens` = `completion_tokens_details.reasoning_tokens`
+/// - **OpenAI-compat (Ollama, vLLM, Groq)**: only `input_tokens` + `output_tokens`,
+///   all other fields default to 0
 #[derive(Debug, Clone, Default)]
-pub struct Usage {
+pub struct TokenUsage {
+    /// Input tokens NOT served from cache.
     pub input_tokens: u32,
+    /// Generated output tokens.
     pub output_tokens: u32,
+    /// Input tokens served from cache (discounted rate).
+    pub cache_read_tokens: u32,
+    /// Input tokens written to cache (may cost more than regular input).
+    pub cache_write_tokens: u32,
+    /// Internal chain-of-thought tokens (OpenAI o1/o3; billed as output).
+    pub reasoning_tokens: u32,
 }
+
+impl TokenUsage {
+    /// Total input tokens across all sources.
+    pub fn total_input(&self) -> u32 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
+
+    /// Total output tokens (reasoning tokens are a subset, not additive).
+    pub fn total_output(&self) -> u32 {
+        self.output_tokens
+    }
+}
+
+/// Backward-compatible alias.
+pub type Usage = TokenUsage;
+
+/// Event emitted during streaming response generation.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// Incremental text content.
+    TextDelta(String),
+    /// A tool_use block is starting.
+    ToolUseStart { id: String, name: String },
+    /// Incremental JSON input for an in-progress tool_use block.
+    ToolInputDelta { id: String, json_chunk: String },
+    /// Stream complete — contains the full accumulated response.
+    Done(ChatResponse),
+}
+
+/// Callback type for streaming events.
+pub type StreamCallback = dyn Fn(StreamEvent) + Send + Sync;
 
 /// LLM Provider trait.
 #[async_trait]
@@ -209,13 +264,33 @@ pub trait Provider: Send + Sync {
     /// Get provider capabilities.
     fn capabilities(&self) -> ProviderCapabilities;
 
-    /// Send a chat completion request.
+    /// Send a chat completion request (non-streaming).
     async fn chat(
         &self,
         system: &str,
         messages: &[Message],
         tools: &[LlmTool],
     ) -> Result<ChatResponse>;
+
+    /// Stream a chat completion, calling `on_event` for each token/tool delta.
+    ///
+    /// Returns the final accumulated `ChatResponse` when the stream ends.
+    /// Default implementation falls back to non-streaming `chat()`.
+    async fn chat_stream(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[LlmTool],
+        on_event: &StreamCallback,
+    ) -> Result<ChatResponse> {
+        let response = self.chat(system, messages, tools).await?;
+        let text = response.text();
+        if !text.is_empty() {
+            on_event(StreamEvent::TextDelta(text));
+        }
+        on_event(StreamEvent::Done(response.clone()));
+        Ok(response)
+    }
 }
 
 /// Create a provider from configuration.
