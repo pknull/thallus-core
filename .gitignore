@@ -1,1 +1,5 @@
 /target
+
+# Assistant tooling state — managed at Thallus umbrella, never per-subproject.
+.claude/
+Memory/
