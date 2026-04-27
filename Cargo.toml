@@ -1,6 +1,6 @@
 [package]
 name = "thallus-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Louis Grenzebach <pk@zalgo.net>"]
 description = "Shared core library for the Thallus decentralized AI infrastructure"
