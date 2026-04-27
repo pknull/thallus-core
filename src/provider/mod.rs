@@ -3,10 +3,10 @@
 //! All providers are compiled in; runtime selection via config.
 
 mod anthropic;
+pub mod cache;
 mod claude_cli;
 pub mod mock;
 mod openai;
-pub mod cache;
 pub mod pricing;
 pub mod retry;
 

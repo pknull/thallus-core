@@ -50,13 +50,9 @@ impl StdioMcpClient {
 
     /// Spawn the subprocess.
     async fn spawn(&self) -> Result<()> {
-        let command = self
-            .config
-            .command
-            .as_ref()
-            .ok_or_else(|| CoreError::Mcp {
-                reason: format!("no command specified for MCP server '{}'", self.name),
-            })?;
+        let command = self.config.command.as_ref().ok_or_else(|| CoreError::Mcp {
+            reason: format!("no command specified for MCP server '{}'", self.name),
+        })?;
 
         let mut cmd = Command::new(command);
         cmd.args(&self.config.args)

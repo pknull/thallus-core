@@ -203,12 +203,12 @@ impl McpPool {
 
         validate_arguments(prefixed_name, tool, &arguments)?;
 
-        let client =
-            self.clients
-                .get(server_name)
-                .ok_or_else(|| CoreError::McpServerNotFound {
-                    name: server_name.to_string(),
-                })?;
+        let client = self
+            .clients
+            .get(server_name)
+            .ok_or_else(|| CoreError::McpServerNotFound {
+                name: server_name.to_string(),
+            })?;
 
         let client = client.read().await;
         let result = client.call_tool(tool_name, arguments).await;
@@ -360,9 +360,7 @@ pub fn sanitize_tool_output(content: &str) -> String {
 
     // Pattern 2: Long base64-like strings (potential keys/tokens) -- 40+ chars of
     // base64 alphabet without spaces
-    let b64_key_re = B64_KEY_RE.get_or_init(|| {
-        Regex::new(r"\b[A-Za-z0-9+/=_-]{40,}\b").unwrap()
-    });
+    let b64_key_re = B64_KEY_RE.get_or_init(|| Regex::new(r"\b[A-Za-z0-9+/=_-]{40,}\b").unwrap());
 
     let mut result = prefix_re.replace_all(content, "[REDACTED]").to_string();
 

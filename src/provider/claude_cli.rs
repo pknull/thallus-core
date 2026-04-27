@@ -142,13 +142,9 @@ impl Provider for ClaudeCodeProvider {
         let mut content = Vec::new();
         let mut accumulated_text = String::new();
 
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|e| CoreError::Provider {
-                reason: format!("Failed to read line: {}", e),
-            })?
-        {
+        while let Some(line) = lines.next_line().await.map_err(|e| CoreError::Provider {
+            reason: format!("Failed to read line: {}", e),
+        })? {
             if line.trim().is_empty() {
                 continue;
             }

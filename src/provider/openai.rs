@@ -31,12 +31,9 @@ impl OpenAiCompatProvider {
                 .clone()
                 .unwrap_or_else(|| "http://localhost:11434/v1".to_string()),
             "openai" => "https://api.openai.com/v1".to_string(),
-            "openai-compat" => config
-                .base_url
-                .clone()
-                .ok_or_else(|| CoreError::Config {
-                    reason: "openai-compat requires base_url".into(),
-                })?,
+            "openai-compat" => config.base_url.clone().ok_or_else(|| CoreError::Config {
+                reason: "openai-compat requires base_url".into(),
+            })?,
             _ => {
                 return Err(CoreError::Config {
                     reason: format!("unsupported provider: {}", config.provider),
@@ -119,11 +116,7 @@ impl OpenAiCompatProvider {
             let body_text = response.text().await.unwrap_or_default();
 
             if is_retryable_status(status_code) && attempt < self.retry_policy.max_retries {
-                tracing::warn!(
-                    attempt,
-                    status = status_code,
-                    "retryable API error"
-                );
+                tracing::warn!(attempt, status = status_code, "retryable API error");
                 last_error = Some(CoreError::Provider {
                     reason: format!("API error {}: {}", status, truncate_error_body(&body_text)),
                 });
@@ -303,8 +296,8 @@ impl OpenAiCompatProvider {
         }
         for (id, name, args_json) in &tool_calls {
             if !name.is_empty() {
-                let arguments: serde_json::Value = serde_json::from_str(args_json)
-                    .unwrap_or(serde_json::json!({}));
+                let arguments: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::json!({}));
                 content.push(ContentBlock::tool_use(id, name, arguments));
             }
         }

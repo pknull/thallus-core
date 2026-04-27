@@ -49,10 +49,7 @@ impl AnthropicProvider {
 
 impl AnthropicProvider {
     /// Send a request with retry on transient failures.
-    async fn send_with_retry(
-        &self,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    async fn send_with_retry(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
         let url = "https://api.anthropic.com/v1/messages";
         let mut last_error: Option<CoreError> = None;
 
@@ -109,11 +106,7 @@ impl AnthropicProvider {
             let body_text = response.text().await.unwrap_or_default();
 
             if is_retryable_status(status_code) && attempt < self.retry_policy.max_retries {
-                tracing::warn!(
-                    attempt,
-                    status = status_code,
-                    "retryable API error"
-                );
+                tracing::warn!(attempt, status = status_code, "retryable API error");
                 last_error = Some(CoreError::Provider {
                     reason: format!("API error {}: {}", status, truncate_error_body(&body_text)),
                 });
@@ -230,11 +223,16 @@ impl AnthropicProvider {
                             // Cache fields are authoritative here — do NOT re-read from message_delta.
                             if let Some(u) = data["message"]["usage"].as_object() {
                                 usage.input_tokens =
-                                    u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                    u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+                                        as u32;
                                 usage.cache_write_tokens =
-                                    u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                    u.get("cache_creation_input_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0) as u32;
                                 usage.cache_read_tokens =
-                                    u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                    u.get("cache_read_input_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0) as u32;
                             }
                         }
 
@@ -247,8 +245,10 @@ impl AnthropicProvider {
                                 }
                                 Some("tool_use") => {
                                     in_tool_block = true;
-                                    current_tool_id = block["id"].as_str().unwrap_or("").to_string();
-                                    current_tool_name = block["name"].as_str().unwrap_or("").to_string();
+                                    current_tool_id =
+                                        block["id"].as_str().unwrap_or("").to_string();
+                                    current_tool_name =
+                                        block["name"].as_str().unwrap_or("").to_string();
                                     current_tool_json.clear();
 
                                     on_event(StreamEvent::ToolUseStart {
@@ -314,7 +314,8 @@ impl AnthropicProvider {
                             }
                             if let Some(u) = data["usage"].as_object() {
                                 usage.output_tokens =
-                                    u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                    u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+                                        as u32;
                             }
                         }
 
@@ -409,12 +410,8 @@ fn parse_anthropic_usage(usage: &serde_json::Value) -> Usage {
     Usage {
         input_tokens: usage["input_tokens"].as_u64().unwrap_or(0) as u32,
         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
-        cache_write_tokens: usage["cache_creation_input_tokens"]
-            .as_u64()
-            .unwrap_or(0) as u32,
-        cache_read_tokens: usage["cache_read_input_tokens"]
-            .as_u64()
-            .unwrap_or(0) as u32,
+        cache_write_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0) as u32,
+        cache_read_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32,
         reasoning_tokens: 0,
     }
 }

@@ -12,8 +12,7 @@
 use async_trait::async_trait;
 
 use super::{
-    ChatResponse, ContentBlock, LlmTool, Message, Provider, ProviderCapabilities, StopReason,
-    Usage,
+    ChatResponse, ContentBlock, LlmTool, Message, Provider, ProviderCapabilities, StopReason, Usage,
 };
 use crate::config::LlmConfig;
 use crate::error::Result;

@@ -61,10 +61,9 @@ impl HttpMcpClient {
             });
         }
 
-        let rpc_response: JsonRpcResponse =
-            response.json().await.map_err(|e| CoreError::Mcp {
-                reason: format!("failed to parse response: {}", e),
-            })?;
+        let rpc_response: JsonRpcResponse = response.json().await.map_err(|e| CoreError::Mcp {
+            reason: format!("failed to parse response: {}", e),
+        })?;
 
         if rpc_response.id != id {
             return Err(CoreError::Mcp {
