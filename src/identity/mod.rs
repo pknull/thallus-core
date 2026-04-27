@@ -1,4 +1,4 @@
-//! Node identity -- Ed25519 keypair for signing attestations.
+//! Node identity -- Ed25519 keypair for signing node-authored messages.
 //!
 //! Each node has one long-term Ed25519 identity used for signing task results
 //! and capability profiles. Public IDs use SSB wire format: `@<base64-pubkey>.ed25519`.
@@ -80,6 +80,7 @@ impl Identity {
 
     /// Load private key from file.
     pub fn load(path: &Path) -> Result<Self> {
+        validate_private_key_permissions(path)?;
         let bytes = std::fs::read(path).map_err(|_| CoreError::IdentityNotFound {
             path: path.display().to_string(),
         })?;
@@ -105,6 +106,26 @@ impl Identity {
             Ok(identity)
         }
     }
+}
+
+fn validate_private_key_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(CoreError::Config {
+                reason: format!(
+                    "private key {} has insecure permissions {:o}; expected owner-only access",
+                    path.display(),
+                    mode
+                ),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 impl PublicId {
@@ -216,6 +237,24 @@ mod tests {
 
         // Same key loaded both times
         assert_eq!(id1.verifying_key(), id2.verifying_key());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_group_readable_private_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("secret.key");
+
+        let identity = Identity::generate();
+        identity.save(&key_path).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        match Identity::load(&key_path) {
+            Ok(_) => panic!("insecure key permissions must fail"),
+            Err(err) => assert!(err.to_string().contains("insecure permissions")),
+        }
     }
 
     #[test]

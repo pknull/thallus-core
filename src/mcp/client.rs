@@ -20,6 +20,14 @@ pub trait McpClient: Send + Sync {
     /// Ping the server to check liveness.
     async fn ping(&self) -> Result<()>;
 
+    /// Drain queued notifications observed from the MCP server.
+    ///
+    /// Most current transports do not surface notifications yet, so the
+    /// default implementation returns an empty list.
+    async fn drain_notifications(&self) -> Result<Vec<McpNotification>> {
+        Ok(vec![])
+    }
+
     /// Shutdown the server connection.
     async fn shutdown(&mut self) -> Result<()>;
 
@@ -105,6 +113,15 @@ pub struct ToolCallResult {
     pub content: Vec<ToolContent>,
     #[serde(default)]
     pub is_error: bool,
+}
+
+/// Notification emitted by an MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpNotification {
+    pub method: String,
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
 }
 
 /// Content item in tool result.
