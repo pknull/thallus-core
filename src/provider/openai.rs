@@ -215,12 +215,7 @@ impl OpenAiCompatProvider {
 
                     // Finish reason
                     if let Some(fr) = choice["finish_reason"].as_str() {
-                        stop_reason = match fr {
-                            "stop" => StopReason::EndTurn,
-                            "tool_calls" => StopReason::ToolUse,
-                            "length" => StopReason::MaxTokens,
-                            _ => StopReason::EndTurn,
-                        };
+                        stop_reason = StopReason::from_openai(fr);
                     }
                 }
                 Err(reqwest_eventsource::Error::StreamEnded) => break,
@@ -305,12 +300,10 @@ impl Provider for OpenAiCompatProvider {
             }
         }
 
-        let stop_reason = match choice["finish_reason"].as_str() {
-            Some("stop") => StopReason::EndTurn,
-            Some("tool_calls") => StopReason::ToolUse,
-            Some("length") => StopReason::MaxTokens,
-            _ => StopReason::EndTurn,
-        };
+        let stop_reason = choice["finish_reason"]
+            .as_str()
+            .map(StopReason::from_openai)
+            .unwrap_or(StopReason::EndTurn);
 
         let usage = parse_openai_usage(&response_body["usage"]);
 

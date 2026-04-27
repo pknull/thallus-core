@@ -247,13 +247,7 @@ impl AnthropicProvider {
 
                         "message_delta" => {
                             if let Some(sr) = data["delta"]["stop_reason"].as_str() {
-                                stop_reason = match sr {
-                                    "end_turn" => StopReason::EndTurn,
-                                    "tool_use" => StopReason::ToolUse,
-                                    "max_tokens" => StopReason::MaxTokens,
-                                    "stop_sequence" => StopReason::StopSequence,
-                                    _ => StopReason::EndTurn,
-                                };
+                                stop_reason = StopReason::from_anthropic(sr);
                             }
                             if let Some(u) = data["usage"].as_object() {
                                 usage.output_tokens =
@@ -316,13 +310,10 @@ impl Provider for AnthropicProvider {
         let response_body = self.send_with_retry(&body).await?;
 
         let content = parse_anthropic_content(&response_body)?;
-        let stop_reason = match response_body["stop_reason"].as_str() {
-            Some("end_turn") => StopReason::EndTurn,
-            Some("tool_use") => StopReason::ToolUse,
-            Some("max_tokens") => StopReason::MaxTokens,
-            Some("stop_sequence") => StopReason::StopSequence,
-            _ => StopReason::EndTurn,
-        };
+        let stop_reason = response_body["stop_reason"]
+            .as_str()
+            .map(StopReason::from_anthropic)
+            .unwrap_or(StopReason::EndTurn);
 
         let usage = parse_anthropic_usage(&response_body["usage"]);
 

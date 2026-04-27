@@ -155,6 +155,29 @@ impl StopReason {
             Self::StopSequence => "stop_sequence",
         }
     }
+
+    /// Map an Anthropic `stop_reason` wire string to a `StopReason`.
+    /// Unknown values fall back to `EndTurn`.
+    pub fn from_anthropic(s: &str) -> Self {
+        match s {
+            "end_turn" => Self::EndTurn,
+            "tool_use" => Self::ToolUse,
+            "max_tokens" => Self::MaxTokens,
+            "stop_sequence" => Self::StopSequence,
+            _ => Self::EndTurn,
+        }
+    }
+
+    /// Map an OpenAI-compatible `finish_reason` wire string to a `StopReason`.
+    /// Unknown values fall back to `EndTurn`.
+    pub fn from_openai(s: &str) -> Self {
+        match s {
+            "stop" => Self::EndTurn,
+            "tool_calls" => Self::ToolUse,
+            "length" => Self::MaxTokens,
+            _ => Self::EndTurn,
+        }
+    }
 }
 
 /// Chat response from provider.
