@@ -71,6 +71,101 @@ pub fn is_retryable_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || err.is_request()
 }
 
+/// Send an HTTP request with retry on transient failures and parse the response as JSON.
+///
+/// `build_request` is called once per attempt to produce a fresh `reqwest::Request`. Build-time
+/// errors are surfaced immediately as non-retryable `CoreError::Provider`; only transport
+/// failures and retryable HTTP status codes (per `is_retryable_error` / `is_retryable_status`)
+/// trigger another attempt with exponential backoff.
+///
+/// `provider` is attached as a structured tracing field on retry / error logs.
+pub(crate) async fn send_json_with_retry<F>(
+    policy: &RetryPolicy,
+    provider: &'static str,
+    client: &reqwest::Client,
+    build_request: F,
+) -> crate::error::Result<serde_json::Value>
+where
+    F: Fn() -> crate::error::Result<reqwest::Request>,
+{
+    use crate::error::CoreError;
+
+    let mut last_error: Option<CoreError> = None;
+
+    for attempt in 0..=policy.max_retries {
+        if attempt > 0 {
+            let backoff = policy.backoff_for_attempt(attempt);
+            tracing::warn!(
+                provider,
+                attempt,
+                backoff_ms = backoff.as_millis() as u64,
+                "retrying request"
+            );
+            tokio::time::sleep(backoff).await;
+        }
+
+        // Build errors are non-retryable: malformed headers, body serialization, etc. are
+        // bugs in the caller, not transient transport issues.
+        let request = build_request()?;
+
+        let response = match client.execute(request).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                if is_retryable_error(&e) && attempt < policy.max_retries {
+                    tracing::warn!(
+                        provider,
+                        attempt,
+                        error = %e,
+                        "transient request error, will retry"
+                    );
+                    last_error = Some(CoreError::Provider {
+                        reason: format!("request failed: {}", e),
+                    });
+                    continue;
+                }
+                return Err(CoreError::Provider {
+                    reason: format!("request failed: {}", e),
+                });
+            }
+        };
+
+        let status = response.status();
+
+        if status.is_success() {
+            return response.json().await.map_err(|e| CoreError::Provider {
+                reason: format!("failed to parse response: {}", e),
+            });
+        }
+
+        let status_code = status.as_u16();
+        let body_text = response.text().await.unwrap_or_default();
+
+        if is_retryable_status(status_code) && attempt < policy.max_retries {
+            tracing::warn!(provider, attempt, status = status_code, "retryable API error");
+            last_error = Some(CoreError::Provider {
+                reason: format!(
+                    "API error {}: {}",
+                    status,
+                    super::truncate_error_body(&body_text)
+                ),
+            });
+            continue;
+        }
+
+        return Err(CoreError::Provider {
+            reason: format!(
+                "API error {}: {}",
+                status,
+                super::truncate_error_body(&body_text)
+            ),
+        });
+    }
+
+    Err(last_error.unwrap_or_else(|| CoreError::Provider {
+        reason: "retries exhausted".into(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

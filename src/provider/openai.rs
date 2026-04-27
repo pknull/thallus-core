@@ -5,9 +5,9 @@ use futures::StreamExt;
 use reqwest_eventsource::{Event, RequestBuilderExt};
 
 use super::{
-    retry::{is_retryable_error, is_retryable_status, RetryPolicy},
-    truncate_error_body, ChatResponse, ContentBlock, Message, Provider, ProviderCapabilities, Role,
-    StopReason, StreamCallback, StreamEvent, Usage,
+    retry::{self, RetryPolicy},
+    ChatResponse, ContentBlock, Message, Provider, ProviderCapabilities, Role, StopReason,
+    StreamCallback, StreamEvent, Usage,
 };
 use crate::config::LlmConfig;
 use crate::error::{CoreError, Result};
@@ -64,73 +64,17 @@ impl OpenAiCompatProvider {
         url: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let mut last_error: Option<CoreError> = None;
-
-        for attempt in 0..=self.retry_policy.max_retries {
-            if attempt > 0 {
-                let backoff = self.retry_policy.backoff_for_attempt(attempt);
-                tracing::warn!(
-                    attempt,
-                    backoff_ms = backoff.as_millis() as u64,
-                    "retrying openai-compat request"
-                );
-                tokio::time::sleep(backoff).await;
+        let auth_header = self.api_key.as_ref().map(|k| format!("Bearer {}", k));
+        retry::send_json_with_retry(&self.retry_policy, "openai-compat", &self.client, || {
+            let mut req = self.client.post(url).json(body);
+            if let Some(ref auth) = auth_header {
+                req = req.header("Authorization", auth);
             }
-
-            let mut request = self.client.post(url).json(body);
-            if let Some(ref api_key) = self.api_key {
-                request = request.header("Authorization", format!("Bearer {}", api_key));
-            }
-
-            let result = request.send().await;
-
-            let response = match result {
-                Ok(resp) => resp,
-                Err(e) => {
-                    if is_retryable_error(&e) && attempt < self.retry_policy.max_retries {
-                        tracing::warn!(
-                            attempt,
-                            error = %e,
-                            "transient request error, will retry"
-                        );
-                        last_error = Some(CoreError::Provider {
-                            reason: format!("request failed: {}", e),
-                        });
-                        continue;
-                    }
-                    return Err(CoreError::Provider {
-                        reason: format!("request failed: {}", e),
-                    });
-                }
-            };
-
-            let status = response.status();
-
-            if status.is_success() {
-                return response.json().await.map_err(|e| CoreError::Provider {
-                    reason: format!("failed to parse response: {}", e),
-                });
-            }
-
-            let status_code = status.as_u16();
-            let body_text = response.text().await.unwrap_or_default();
-
-            if is_retryable_status(status_code) && attempt < self.retry_policy.max_retries {
-                tracing::warn!(attempt, status = status_code, "retryable API error");
-                last_error = Some(CoreError::Provider {
-                    reason: format!("API error {}: {}", status, truncate_error_body(&body_text)),
-                });
-                continue;
-            }
-
-            return Err(CoreError::Provider {
-                reason: format!("API error {}: {}", status, truncate_error_body(&body_text)),
-            });
-        }
-
-        Err(last_error.unwrap_or_else(|| CoreError::Provider {
-            reason: "retries exhausted".into(),
-        }))
+            req.build().map_err(|e| CoreError::Provider {
+                reason: format!("failed to build request: {}", e),
+            })
+        })
+        .await
     }
 
     /// Build the OpenAI-format request body.

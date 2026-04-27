@@ -5,15 +5,16 @@ use futures::StreamExt;
 use reqwest_eventsource::{Event, RequestBuilderExt};
 
 use super::{
-    retry::{is_retryable_error, is_retryable_status, RetryPolicy},
-    truncate_error_body, ChatResponse, ContentBlock, Message, Provider, ProviderCapabilities,
-    StopReason, StreamCallback, StreamEvent, Usage,
+    retry::{self, RetryPolicy},
+    ChatResponse, ContentBlock, Message, Provider, ProviderCapabilities, StopReason,
+    StreamCallback, StreamEvent, Usage,
 };
 use crate::config::LlmConfig;
 use crate::error::{CoreError, Result};
 use crate::mcp::LlmTool;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Anthropic Claude provider.
 pub struct AnthropicProvider {
@@ -50,77 +51,19 @@ impl AnthropicProvider {
 impl AnthropicProvider {
     /// Send a request with retry on transient failures.
     async fn send_with_retry(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
-        let url = "https://api.anthropic.com/v1/messages";
-        let mut last_error: Option<CoreError> = None;
-
-        for attempt in 0..=self.retry_policy.max_retries {
-            if attempt > 0 {
-                let backoff = self.retry_policy.backoff_for_attempt(attempt);
-                tracing::warn!(
-                    attempt,
-                    backoff_ms = backoff.as_millis() as u64,
-                    "retrying anthropic request"
-                );
-                tokio::time::sleep(backoff).await;
-            }
-
-            let result = self
-                .client
-                .post(url)
+        retry::send_json_with_retry(&self.retry_policy, "anthropic", &self.client, || {
+            self.client
+                .post(ANTHROPIC_API_URL)
                 .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("content-type", "application/json")
                 .json(body)
-                .send()
-                .await;
-
-            let response = match result {
-                Ok(resp) => resp,
-                Err(e) => {
-                    if is_retryable_error(&e) && attempt < self.retry_policy.max_retries {
-                        tracing::warn!(
-                            attempt,
-                            error = %e,
-                            "transient request error, will retry"
-                        );
-                        last_error = Some(CoreError::Provider {
-                            reason: format!("request failed: {}", e),
-                        });
-                        continue;
-                    }
-                    return Err(CoreError::Provider {
-                        reason: format!("request failed: {}", e),
-                    });
-                }
-            };
-
-            let status = response.status();
-
-            if status.is_success() {
-                return response.json().await.map_err(|e| CoreError::Provider {
-                    reason: format!("failed to parse response: {}", e),
-                });
-            }
-
-            let status_code = status.as_u16();
-            let body_text = response.text().await.unwrap_or_default();
-
-            if is_retryable_status(status_code) && attempt < self.retry_policy.max_retries {
-                tracing::warn!(attempt, status = status_code, "retryable API error");
-                last_error = Some(CoreError::Provider {
-                    reason: format!("API error {}: {}", status, truncate_error_body(&body_text)),
-                });
-                continue;
-            }
-
-            return Err(CoreError::Provider {
-                reason: format!("API error {}: {}", status, truncate_error_body(&body_text)),
-            });
-        }
-
-        Err(last_error.unwrap_or_else(|| CoreError::Provider {
-            reason: "retries exhausted".into(),
-        }))
+                .build()
+                .map_err(|e| CoreError::Provider {
+                    reason: format!("failed to build request: {}", e),
+                })
+        })
+        .await
     }
 
     /// Build the Anthropic request body from messages and tools.
