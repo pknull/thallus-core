@@ -1,6 +1,6 @@
 //! MCP client pool -- manages multiple MCP server connections.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +17,12 @@ use crate::mcp::stdio::StdioMcpClient;
 /// Pool of MCP clients with tool introspection.
 pub struct McpPool {
     clients: HashMap<String, Arc<RwLock<Box<dyn McpClient>>>>,
-    server_runtime: HashMap<String, McpServerRuntime>,
+    /// Servers for which `initialize_all` has completed successfully. Used to gate
+    /// `health_check` so it does not poll un-initialized clients (which would trip the
+    /// circuit breaker before bootstrap is done). Cleared on `shutdown_all`; re-adding
+    /// the same server name via `add_client` clears its prior entry so a replacement
+    /// client must re-initialize before its first health probe.
+    initialized_servers: HashSet<String>,
     /// Circuit breakers per server.
     circuit_breakers: HashMap<String, RwLock<CircuitBreaker>>,
     /// All tools with prefixed names, mapped to their server.
@@ -30,19 +35,12 @@ struct RegisteredTool {
     validator: Option<JSONSchema>,
 }
 
-#[derive(Debug, Clone)]
-struct McpServerRuntime {
-    #[allow(dead_code)]
-    transport: String,
-    initialized: bool,
-}
-
 impl McpPool {
     /// Create a new empty pool.
     pub fn new() -> Self {
         Self {
             clients: HashMap::new(),
-            server_runtime: HashMap::new(),
+            initialized_servers: HashSet::new(),
             circuit_breakers: HashMap::new(),
             tools: HashMap::new(),
         }
@@ -62,13 +60,10 @@ impl McpPool {
 
         self.clients
             .insert(name.to_string(), Arc::new(RwLock::new(client)));
-        self.server_runtime.insert(
-            name.to_string(),
-            McpServerRuntime {
-                transport: config.transport.clone(),
-                initialized: false,
-            },
-        );
+        // Re-adding a server name overwrites the client entry above; make sure any
+        // prior init state is cleared so the replacement must re-initialize before
+        // health_check pings it.
+        self.initialized_servers.remove(name);
 
         // Add circuit breaker for this server
         let cb_config = CircuitBreakerConfig {
@@ -113,9 +108,7 @@ impl McpPool {
                 );
             }
 
-            if let Some(runtime) = self.server_runtime.get_mut(&name) {
-                runtime.initialized = true;
-            }
+            self.initialized_servers.insert(name.clone());
         }
 
         tracing::info!(
@@ -243,11 +236,7 @@ impl McpPool {
     /// Call this periodically to proactively detect server failures.
     pub async fn health_check(&self) {
         for (name, client) in &self.clients {
-            let Some(runtime) = self.server_runtime.get(name) else {
-                continue;
-            };
-
-            if !runtime.initialized {
+            if !self.initialized_servers.contains(name) {
                 continue;
             }
 
@@ -292,12 +281,14 @@ impl McpPool {
         }
     }
 
-    /// Shutdown all clients.
-    pub async fn shutdown_all(&self) -> Result<()> {
+    /// Shutdown all clients and clear the init-tracking set so a subsequent
+    /// `health_check` does not ping shut-down servers.
+    pub async fn shutdown_all(&mut self) -> Result<()> {
         for client in self.clients.values() {
             let mut client = client.write().await;
             let _ = client.shutdown().await;
         }
+        self.initialized_servers.clear();
         Ok(())
     }
 }
