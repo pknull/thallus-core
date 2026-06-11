@@ -141,7 +141,12 @@ where
         let body_text = response.text().await.unwrap_or_default();
 
         if is_retryable_status(status_code) && attempt < policy.max_retries {
-            tracing::warn!(provider, attempt, status = status_code, "retryable API error");
+            tracing::warn!(
+                provider,
+                attempt,
+                status = status_code,
+                "retryable API error"
+            );
             last_error = Some(CoreError::Provider {
                 reason: format!(
                     "API error {}: {}",
@@ -193,9 +198,9 @@ mod tests {
             let d3 = policy.backoff_for_attempt(3).as_millis();
 
             // With jitter, d1 ~ 75-125ms, d2 ~ 150-250ms, d3 ~ 300-500ms
-            assert!(d1 >= 50 && d1 <= 200, "d1={}", d1);
-            assert!(d2 >= 100 && d2 <= 400, "d2={}", d2);
-            assert!(d3 >= 200 && d3 <= 700, "d3={}", d3);
+            assert!((50..=200).contains(&d1), "d1={}", d1);
+            assert!((100..=400).contains(&d2), "d2={}", d2);
+            assert!((200..=700).contains(&d3), "d3={}", d3);
         }
     }
 

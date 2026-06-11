@@ -326,11 +326,6 @@ impl Provider for OpenAiCompatProvider {
     }
 }
 
-/// Convert a Message to one or more OpenAI Chat Completions API messages.
-///
-/// OpenAI format differences from Anthropic:
-/// - Assistant tool calls go in `tool_calls` array on the message
-/// - Tool results are separate messages with `role: "tool"` and `tool_call_id`
 /// Parse OpenAI usage object into canonical TokenUsage.
 ///
 /// OpenAI's `prompt_tokens` INCLUDES cached tokens (unlike Anthropic).
@@ -355,6 +350,11 @@ fn parse_openai_usage(usage: &serde_json::Value) -> Usage {
     }
 }
 
+/// Convert a Message to one or more OpenAI Chat Completions API messages.
+///
+/// OpenAI format differences from Anthropic:
+/// - Assistant tool calls go in `tool_calls` array on the message
+/// - Tool results are separate messages with `role: "tool"` and `tool_call_id`
 fn convert_message_to_openai(msg: &Message) -> Vec<serde_json::Value> {
     let role = match msg.role {
         Role::User => "user",

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 
-use super::{ChatResponse, Message, TokenUsage};
+use super::{ChatResponse, Message};
 use crate::mcp::LlmTool;
 
 /// Cache statistics.
@@ -153,7 +153,7 @@ fn fingerprint(model: &str, system: &str, messages: &[Message], tools: &[LlmTool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ContentBlock, StopReason};
+    use crate::provider::{ContentBlock, StopReason, TokenUsage};
 
     fn mock_response(text: &str) -> ChatResponse {
         ChatResponse {
