@@ -4,14 +4,12 @@
 
 mod anthropic;
 pub mod cache;
-mod claude_cli;
 pub mod mock;
 mod openai;
 pub mod pricing;
 pub mod retry;
 
 pub use anthropic::AnthropicProvider;
-pub use claude_cli::ClaudeCodeProvider;
 pub use mock::MockProvider;
 pub use openai::OpenAiCompatProvider;
 
@@ -321,7 +319,6 @@ pub fn create_provider(config: &LlmConfig) -> Result<Box<dyn Provider>> {
     match config.provider.as_str() {
         "anthropic" => Ok(Box::new(AnthropicProvider::new(config)?)),
         "openai" | "ollama" | "openai-compat" => Ok(Box::new(OpenAiCompatProvider::new(config)?)),
-        "claude-code" => Ok(Box::new(ClaudeCodeProvider::new(config)?)),
         "mock" => Ok(Box::new(MockProvider::new(config)?)),
         other => Err(CoreError::Provider {
             reason: format!("unknown provider: {}", other),
