@@ -2,6 +2,23 @@
 
 All notable changes to thallus-core are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this crate's pre-1.0 versioning treats minor bumps as the breaking-change signal.
 
+## [Unreleased]
+
+### Added
+
+- `MockProvider` call recording for integration-test assertions and one-shot tool-call responses that let mock-driven agent loops terminate.
+
+### Changed
+
+- Removed the unused `ClaudeCodeProvider` and its `claude-code` factory option.
+- Updated dependencies to address known vulnerabilities and updated the CI Actions runtime.
+
+### Fixed
+
+- Provider request-build failures are no longer treated as transient transport failures and retried.
+- `McpPool` now requires reinitialization after replacing a client and clears initialization state during shutdown.
+- Corrected README names for the public MCP clients and OpenAI-compatible provider, and documented the current provider and streaming interfaces.
+
 ## [0.3.0] - 2026-04-27
 
 ### Added
