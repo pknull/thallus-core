@@ -1,5 +1,11 @@
 /target
 
-# Assistant tooling state — managed at Thallus umbrella, never per-subproject.
+# Harness-local state (Memory v2 pair is tracked; see managed block below)
 .claude/
-Memory/
+# Asha Memory v2 recovery (managed)
+/Work/memory-migration/
+/Work/session-state/
+# Asha Control private context (managed)
+/.asha/control-task.json
+/.asha/result.json
+/.asha/outbox/
