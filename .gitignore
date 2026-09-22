@@ -1,6 +1,6 @@
 /target
 
-# Harness-local state (Memory v2 pair is tracked; see managed block below)
+# Harness-local state
 .claude/
 # Asha Memory v2 recovery (managed)
 /Work/memory-migration/
@@ -9,3 +9,15 @@
 /.asha/control-task.json
 /.asha/result.json
 /.asha/outbox/
+
+# >>> asha workspace private roots >>>
+memory-local/
+Work/
+knowledge/
+Memory/
+!.asha/
+.asha/*
+!.asha/config.json
+.asha/cache/
+.asha/state/
+# <<< asha workspace private roots <<<
