@@ -71,7 +71,7 @@ impl OpenAiCompatProvider {
                 req = req.header("Authorization", auth);
             }
             req.build().map_err(|e| CoreError::Provider {
-                reason: format!("failed to build request: {}", e),
+                reason: format!("failed to build request: {}", e.without_url()),
             })
         })
         .await
@@ -222,7 +222,7 @@ impl OpenAiCompatProvider {
                 Err(e) => {
                     es.close();
                     return Err(CoreError::Provider {
-                        reason: format!("SSE stream error: {}", e),
+                        reason: format!("SSE stream error: {}", super::sse_error_without_url(e)),
                     });
                 }
             }

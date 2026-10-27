@@ -52,7 +52,7 @@ impl HttpMcpClient {
             .send()
             .await
             .map_err(|e| CoreError::Mcp {
-                reason: format!("HTTP request failed: {}", e),
+                reason: format!("HTTP request failed: {}", e.without_url()),
             })?;
 
         if !response.status().is_success() {
@@ -62,7 +62,7 @@ impl HttpMcpClient {
         }
 
         let rpc_response: JsonRpcResponse = response.json().await.map_err(|e| CoreError::Mcp {
-            reason: format!("failed to parse response: {}", e),
+            reason: format!("failed to parse response: {}", e.without_url()),
         })?;
 
         if rpc_response.id != id {

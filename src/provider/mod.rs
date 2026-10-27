@@ -38,6 +38,16 @@ pub(crate) fn truncate_error_body(body: &str) -> String {
     }
 }
 
+/// Drop the request URL, which can carry credentials, from an SSE stream error.
+pub(crate) fn sse_error_without_url(err: reqwest_eventsource::Error) -> reqwest_eventsource::Error {
+    match err {
+        reqwest_eventsource::Error::Transport(e) => {
+            reqwest_eventsource::Error::Transport(e.without_url())
+        }
+        other => other,
+    }
+}
+
 /// Provider capabilities.
 #[derive(Debug, Clone, Default)]
 pub struct ProviderCapabilities {

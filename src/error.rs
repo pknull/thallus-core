@@ -31,8 +31,15 @@ pub enum CoreError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// Built through `From`, which drops the request URL.
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[source] reqwest::Error),
+}
+
+impl From<reqwest::Error> for CoreError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Http(err.without_url())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

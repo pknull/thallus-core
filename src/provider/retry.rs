@@ -111,6 +111,7 @@ where
         let response = match client.execute(request).await {
             Ok(resp) => resp,
             Err(e) => {
+                let e = e.without_url();
                 if is_retryable_error(&e) && attempt < policy.max_retries {
                     tracing::warn!(
                         provider,
@@ -133,7 +134,7 @@ where
 
         if status.is_success() {
             return response.json().await.map_err(|e| CoreError::Provider {
-                reason: format!("failed to parse response: {}", e),
+                reason: format!("failed to parse response: {}", e.without_url()),
             });
         }
 
