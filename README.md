@@ -95,3 +95,11 @@ let signature = identity.sign(b"hello world");
 cargo build
 cargo test
 ```
+
+### System packages
+
+Building needs a C toolchain for `ring`. On Debian or Ubuntu:
+
+```bash
+sudo apt-get install build-essential
+```
