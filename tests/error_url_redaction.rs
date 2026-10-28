@@ -204,7 +204,15 @@ where
     port
 }
 
-struct Capture(Arc<Mutex<Vec<String>>>);
+thread_local! {
+    static SINK: std::cell::RefCell<Option<Arc<Mutex<Vec<String>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One process-wide subscriber that routes each event to the sink of the
+/// thread that emitted it. Scoped per-test subscribers race on tracing's
+/// callsite interest cache, so every test shares this one.
+struct Capture;
 
 struct Line(String);
 
@@ -226,17 +234,33 @@ impl tracing::Subscriber for Capture {
     fn event(&self, event: &tracing::Event<'_>) {
         let mut line = Line(String::new());
         event.record(&mut line);
-        self.0.lock().unwrap().push(line.0);
+        SINK.with(|sink| {
+            if let Some(sink) = sink.borrow().as_ref() {
+                sink.lock().unwrap().push(line.0);
+            }
+        });
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
+struct SinkGuard;
+
+impl Drop for SinkGuard {
+    fn drop(&mut self) {
+        SINK.with(|sink| *sink.borrow_mut() = None);
+    }
+}
+
 /// Capture every tracing event on this thread until the guard drops.
-fn capture_logs() -> (tracing::subscriber::DefaultGuard, Arc<Mutex<Vec<String>>>) {
+fn capture_logs() -> (SinkGuard, Arc<Mutex<Vec<String>>>) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        tracing::subscriber::set_global_default(Capture).expect("no other global subscriber");
+    });
     let lines = Arc::new(Mutex::new(Vec::new()));
-    let guard = tracing::subscriber::set_default(Capture(Arc::clone(&lines)));
-    (guard, lines)
+    SINK.with(|sink| *sink.borrow_mut() = Some(Arc::clone(&lines)));
+    (SinkGuard, lines)
 }
 
 fn http_mcp(port: u16) -> McpServerConfig {
@@ -747,12 +771,16 @@ async fn pool_with_schema(
     tool_name: &str,
     schema: serde_json::Value,
 ) -> Result<McpPool, CoreError> {
-    let tool_name = tool_name.to_string();
+    pool_with_tools(vec![
+        serde_json::json!({"name": tool_name, "inputSchema": schema}),
+    ])
+    .await
+}
+
+async fn pool_with_tools(tools: Vec<serde_json::Value>) -> Result<McpPool, CoreError> {
     let port = serve(move |req| {
         let result = match req["method"].as_str() {
-            Some("tools/list") => {
-                serde_json::json!({"tools": [{"name": tool_name, "inputSchema": schema}]})
-            }
+            Some("tools/list") => serde_json::json!({ "tools": tools }),
             _ => init_result("s", "1"),
         };
         json_ok(&serde_json::json!({"jsonrpc": "2.0", "id": rpc_id(&req), "result": result}))
@@ -816,10 +844,9 @@ async fn schema_compile_error_is_bounded_and_actionable() {
         "type": "object",
         "properties": {"mode": {"type": 5}}
     });
-    let tool = format!("{LEAK}-http://alice:s3cret@h/p?token=tok-9f2");
     let (_guard, logs) = capture_logs();
 
-    let err = pool_with_schema(&tool, schema)
+    let err = pool_with_schema("run", schema)
         .await
         .err()
         .expect("must fail");
@@ -913,4 +940,222 @@ fn invalid_public_id_is_not_echoed() {
     let id = thallus_core::PublicId(format!("@{LEAK}!.ed25519"));
     let err = id.to_verifying_key().unwrap_err();
     assert_no_leak(&err.to_string());
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2: declaration walk, tool names, redirects, pointer escaping.
+// ---------------------------------------------------------------------------
+
+/// Validate `args` against `schema` and return the error text, its Debug form
+/// and the captured warnings.
+async fn rejection(schema: serde_json::Value, args: serde_json::Value) -> (String, String, String) {
+    let pool = pool_with_schema("run", schema).await.unwrap();
+    let (_guard, logs) = capture_logs();
+    let err = pool.call_tool("srv_run", args).await.unwrap_err();
+    let logs = logs.lock().unwrap().join("\n");
+    (err.to_string(), format!("{err:?} {err:#?}"), logs)
+}
+
+fn assert_clean(parts: &[&String]) {
+    for part in parts {
+        assert_no_leak(part);
+    }
+}
+
+#[tokio::test]
+async fn annotation_payload_does_not_declare_names() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": {"type": "integer"},
+        "default": {"properties": {LEAK: 0}},
+        "examples": [{"properties": {LEAK: 0}}],
+        "const": {"properties": {LEAK: 0}},
+        "enum": [{"properties": {LEAK: 0}}]
+    });
+
+    let (display, debug, logs) = rejection(schema, serde_json::json!({ LEAK: "x" })).await;
+
+    assert_clean(&[&display, &debug, &logs]);
+    assert!(display.contains("/<key>"), "{display}");
+}
+
+#[tokio::test]
+async fn property_named_properties_does_not_declare_siblings() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"properties": {
+            "type": "object",
+            LEAK: 0,
+            "additionalProperties": {"type": "integer"}
+        }}
+    });
+
+    let (display, debug, logs) =
+        rejection(schema, serde_json::json!({"properties": { LEAK: "x" }})).await;
+
+    assert_clean(&[&display, &debug, &logs]);
+    assert!(display.contains("/properties/<key>"), "{display}");
+}
+
+#[tokio::test]
+async fn ref_siblings_do_not_declare_names() {
+    let schema = serde_json::json!({
+        "$ref": "#/$defs/body",
+        "properties": {LEAK: {"type": "integer"}},
+        "$defs": {"body": {"type": "object", "additionalProperties": {"type": "integer"}}}
+    });
+
+    let (display, debug, logs) = rejection(schema, serde_json::json!({ LEAK: "x" })).await;
+
+    assert_clean(&[&display, &debug, &logs]);
+}
+
+#[tokio::test]
+async fn nested_subschema_names_are_declared() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"outer": {"allOf": [{"properties": {"inner": {"type": "integer"}}}]}}
+    });
+
+    let (display, _, _) = rejection(schema, serde_json::json!({"outer": {"inner": "x"}})).await;
+
+    assert!(display.contains("/outer/inner: type failed"), "{display}");
+}
+
+#[tokio::test]
+async fn pointer_segments_are_escaped() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "a/b": {"type": "integer"},
+            "c~d": {"type": "integer"},
+            "": {"type": "integer"}
+        }
+    });
+    for (key, expected) in [
+        ("a/b", "/a~1b: type"),
+        ("c~d", "/c~0d: type"),
+        ("", "/: type"),
+    ] {
+        let (display, _, _) = rejection(schema.clone(), serde_json::json!({ key: "x" })).await;
+        assert!(display.contains(expected), "{expected} missing: {display}");
+    }
+}
+
+#[tokio::test]
+async fn non_identifier_tool_names_are_not_registered() {
+    let long = "a".repeat(65);
+    let bad = format!("{LEAK}?token=t");
+    let (_guard, logs) = capture_logs();
+    let pool = pool_with_tools(vec![
+        serde_json::json!({"name": "ok_tool"}),
+        serde_json::json!({"name": bad}),
+        serde_json::json!({"name": ""}),
+        serde_json::json!({"name": long}),
+        serde_json::json!({"name": "-lead"}),
+        serde_json::json!({"name": "a".repeat(64)}),
+    ])
+    .await
+    .unwrap();
+
+    let names: Vec<String> = pool
+        .all_tools()
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.contains(&"srv_ok_tool".to_string()), "{names:?}");
+
+    let logs = logs.lock().unwrap().join("\n");
+    assert!(logs.contains("skipped"), "no skip warning: {logs}");
+    assert_no_leak(&logs);
+}
+
+#[tokio::test]
+async fn unknown_tool_error_omits_supplied_name() {
+    let pool = pool_with_tools(vec![serde_json::json!({"name": "ok"})])
+        .await
+        .unwrap();
+
+    let err = pool
+        .call_tool(&format!("srv_{SERVER_URL}{LEAK}"), serde_json::json!({}))
+        .await
+        .unwrap_err();
+
+    assert_no_leak(&err.to_string());
+    assert_no_url(&err.to_string(), SERVER_URL);
+    assert!(err.to_string().contains("unknown tool"), "{err}");
+}
+
+/// A second origin that records the raw request it receives.
+async fn recorder() -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_lowercase());
+                let _ = socket
+                    .write_all(&response("200 OK", "text/plain", "x"))
+                    .await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+async fn redirecting_to(second: u16) -> u16 {
+    serve(move |_| {
+        format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{second}/v1/messages\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    })
+    .await
+}
+
+const REDIRECT_KEY: &str = "key-redirect-5d2e";
+
+#[tokio::test]
+async fn anthropic_chat_does_not_forward_key_on_redirect() {
+    let (second, seen) = recorder().await;
+    let first = redirecting_to(second).await;
+    let base = format!("http://127.0.0.1:{first}");
+    let mut config = anthropic(&base, "THALLUS_TEST_KEY_REDIR1");
+    std::env::set_var("THALLUS_TEST_KEY_REDIR1", REDIRECT_KEY);
+    config.max_retries = Some(0);
+    let provider = create_provider(&config).unwrap();
+
+    let _ = provider.chat("", &[Message::user("hi")], &[]).await;
+
+    let seen = seen.lock().unwrap().join("\n");
+    assert!(!seen.contains(REDIRECT_KEY), "key forwarded: {seen}");
+}
+
+#[tokio::test]
+async fn anthropic_stream_does_not_forward_key_on_redirect() {
+    let (second, seen) = recorder().await;
+    let first = redirecting_to(second).await;
+    let base = format!("http://127.0.0.1:{first}");
+    let config = anthropic(&base, "THALLUS_TEST_KEY_REDIR2");
+    std::env::set_var("THALLUS_TEST_KEY_REDIR2", REDIRECT_KEY);
+    let provider = create_provider(&config).unwrap();
+
+    let _ = provider
+        .chat_stream("", &[Message::user("hi")], &[], &|_: StreamEvent| {})
+        .await;
+
+    let seen = seen.lock().unwrap().join("\n");
+    assert!(!seen.contains(REDIRECT_KEY), "key forwarded: {seen}");
 }

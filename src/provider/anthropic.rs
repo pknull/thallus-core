@@ -43,7 +43,16 @@ impl AnthropicProvider {
         let messages_url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
 
         Ok(Self {
-            client: reqwest::Client::new(),
+            // Credential-bearing requests must not follow redirects to another origin.
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| CoreError::Config {
+                    reason: format!(
+                        "failed to build HTTP client: {}",
+                        crate::error::http_error_text(e)
+                    ),
+                })?,
             messages_url,
             api_key,
             model: config.model.clone(),

@@ -96,7 +96,14 @@ impl McpPool {
 
             // List and register tools
             let tools = client.list_tools().await?;
+            let mut skipped = 0usize;
             for (index, tool) in tools.into_iter().enumerate() {
+                // Registered names become part of diagnostics, so only bounded
+                // identifiers are accepted from the server.
+                if !is_valid_tool_name(&tool.name) {
+                    skipped += 1;
+                    continue;
+                }
                 let prefixed_name = tool.prefixed_name(&name);
                 let validator = compile_validator(&name, index, &tool)?;
                 self.tools.insert(
@@ -106,6 +113,14 @@ impl McpPool {
                         definition: tool,
                         validator,
                     },
+                );
+            }
+
+            if skipped > 0 {
+                tracing::warn!(
+                    server = %name,
+                    skipped,
+                    "skipped MCP tools whose advertised names are not valid identifiers"
                 );
             }
 
@@ -172,7 +187,7 @@ impl McpPool {
             .tools
             .get(prefixed_name)
             .ok_or_else(|| CoreError::Mcp {
-                reason: format!("unknown tool: {}", prefixed_name),
+                reason: "unknown tool".to_string(),
             })?;
         let tool_name = tool.definition.name.as_str();
         let server_name = &tool.server_name;
@@ -507,22 +522,81 @@ const SCHEMA_KEYWORDS: &[&str] = &[
     "unevaluatedProperties",
 ];
 
-/// Property names the tool's schema declares under any `properties`.
-fn declared_names(schema: &serde_json::Value) -> HashSet<&str> {
-    fn walk<'a>(value: &'a serde_json::Value, out: &mut HashSet<&'a str>) {
-        match value {
-            serde_json::Value::Object(map) => {
-                if let Some(serde_json::Value::Object(props)) = map.get("properties") {
-                    out.extend(props.keys().map(String::as_str));
-                }
-                map.values().for_each(|v| walk(v, out));
-            }
-            serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
-            _ => {}
+/// A tool name the pool accepts: 1-64 ASCII letters, digits, `_`, `.` or `-`,
+/// starting with a letter or digit.
+fn is_valid_tool_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 64
+        && first.is_ascii_alphanumeric()
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Property names the tool's schema declares.
+///
+/// Only real schema positions are visited. Annotation and data keywords
+/// (`default`, `examples`, `const`, `enum`, `title`, `description`) and unknown
+/// keywords are never entered. `$ref` is not followed; an object with a `$ref`
+/// contributes only its `$defs`/`definitions`, since draft 7 ignores siblings.
+fn declared_names(root: &serde_json::Value) -> HashSet<&str> {
+    use serde_json::Value;
+
+    fn each_value<'a>(value: &'a Value, out: &mut HashSet<&'a str>) {
+        if let Value::Object(map) = value {
+            map.values().for_each(|v| schema(v, out));
         }
     }
+
+    fn schema<'a>(value: &'a Value, out: &mut HashSet<&'a str>) {
+        let Value::Object(map) = value else {
+            return;
+        };
+        for key in ["$defs", "definitions"] {
+            if let Some(defs) = map.get(key) {
+                each_value(defs, out);
+            }
+        }
+        if map.get("$ref").is_some_and(Value::is_string) {
+            return;
+        }
+        if let Some(Value::Object(props)) = map.get("properties") {
+            out.extend(props.keys().map(String::as_str));
+            props.values().for_each(|v| schema(v, out));
+        }
+        for key in ["patternProperties", "dependentSchemas", "dependencies"] {
+            if let Some(group) = map.get(key) {
+                each_value(group, out);
+            }
+        }
+        for key in [
+            "additionalProperties",
+            "additionalItems",
+            "contains",
+            "propertyNames",
+            "not",
+            "if",
+            "then",
+            "else",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+        ] {
+            if let Some(sub) = map.get(key) {
+                schema(sub, out);
+            }
+        }
+        for key in ["items", "prefixItems", "allOf", "anyOf", "oneOf"] {
+            match map.get(key) {
+                Some(Value::Array(subs)) => subs.iter().for_each(|v| schema(v, out)),
+                Some(sub) => schema(sub, out),
+                None => {}
+            }
+        }
+    }
+
     let mut out = HashSet::new();
-    walk(schema, &mut out);
+    schema(root, &mut out);
     out
 }
 
@@ -539,7 +613,7 @@ fn render_path(path: &jsonschema::paths::JSONPointer, declared: &HashSet<&str>) 
             PathChunk::Keyword(k) => out.push_str(k),
             PathChunk::Property(name) => {
                 if declared.contains(&**name) || SCHEMA_KEYWORDS.contains(&&**name) {
-                    out.push_str(name);
+                    out.push_str(&name.replace('~', "~0").replace('/', "~1"));
                 } else {
                     out.push_str("<key>");
                 }

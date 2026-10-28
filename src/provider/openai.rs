@@ -47,7 +47,16 @@ impl OpenAiCompatProvider {
             .and_then(|env| std::env::var(env).ok());
 
         Ok(Self {
-            client: reqwest::Client::new(),
+            // Credential-bearing requests must not follow redirects to another origin.
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| CoreError::Config {
+                    reason: format!(
+                        "failed to build HTTP client: {}",
+                        crate::error::http_error_text(e)
+                    ),
+                })?,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model: config.model.clone(),
