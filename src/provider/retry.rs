@@ -88,7 +88,7 @@ pub(crate) async fn send_json_with_retry<F>(
 where
     F: Fn() -> crate::error::Result<reqwest::Request>,
 {
-    use crate::error::CoreError;
+    use crate::error::{http_error_text, status_text, CoreError};
 
     let mut last_error: Option<CoreError> = None;
 
@@ -111,21 +111,22 @@ where
         let response = match client.execute(request).await {
             Ok(resp) => resp,
             Err(e) => {
-                let e = e.without_url();
-                if is_retryable_error(&e) && attempt < policy.max_retries {
+                let retryable = is_retryable_error(&e);
+                let text = http_error_text(e);
+                if retryable && attempt < policy.max_retries {
                     tracing::warn!(
                         provider,
                         attempt,
-                        error = %e,
+                        error = %text,
                         "transient request error, will retry"
                     );
                     last_error = Some(CoreError::Provider {
-                        reason: format!("request failed: {}", e),
+                        reason: format!("request failed: {}", text),
                     });
                     continue;
                 }
                 return Err(CoreError::Provider {
-                    reason: format!("request failed: {}", e),
+                    reason: format!("request failed: {}", text),
                 });
             }
         };
@@ -134,12 +135,13 @@ where
 
         if status.is_success() {
             return response.json().await.map_err(|e| CoreError::Provider {
-                reason: format!("failed to parse response: {}", e.without_url()),
+                reason: format!("failed to parse response: {}", http_error_text(e)),
             });
         }
 
+        // The response body is dropped: it can echo credentials or URLs.
         let status_code = status.as_u16();
-        let body_text = response.text().await.unwrap_or_default();
+        let reason = format!("API error {}", status_text(status_code));
 
         if is_retryable_status(status_code) && attempt < policy.max_retries {
             tracing::warn!(
@@ -148,23 +150,11 @@ where
                 status = status_code,
                 "retryable API error"
             );
-            last_error = Some(CoreError::Provider {
-                reason: format!(
-                    "API error {}: {}",
-                    status,
-                    super::truncate_error_body(&body_text)
-                ),
-            });
+            last_error = Some(CoreError::Provider { reason });
             continue;
         }
 
-        return Err(CoreError::Provider {
-            reason: format!(
-                "API error {}: {}",
-                status,
-                super::truncate_error_body(&body_text)
-            ),
-        });
+        return Err(CoreError::Provider { reason });
     }
 
     Err(last_error.unwrap_or_else(|| CoreError::Provider {

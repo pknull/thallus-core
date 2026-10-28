@@ -36,7 +36,7 @@ impl OpenAiCompatProvider {
             })?,
             _ => {
                 return Err(CoreError::Config {
-                    reason: format!("unsupported provider: {}", config.provider),
+                    reason: "unsupported provider".into(),
                 })
             }
         };
@@ -71,7 +71,10 @@ impl OpenAiCompatProvider {
                 req = req.header("Authorization", auth);
             }
             req.build().map_err(|e| CoreError::Provider {
-                reason: format!("failed to build request: {}", e.without_url()),
+                reason: format!(
+                    "failed to build request: {}",
+                    crate::error::http_error_text(e)
+                ),
             })
         })
         .await
@@ -140,8 +143,8 @@ impl OpenAiCompatProvider {
             request = request.header("Authorization", format!("Bearer {}", api_key));
         }
 
-        let mut es = request.eventsource().map_err(|e| CoreError::Provider {
-            reason: format!("failed to create event source: {}", e),
+        let mut es = request.eventsource().map_err(|_| CoreError::Provider {
+            reason: "failed to create event source".into(),
         })?;
 
         let mut text_content = String::new();
@@ -222,7 +225,7 @@ impl OpenAiCompatProvider {
                 Err(e) => {
                     es.close();
                     return Err(CoreError::Provider {
-                        reason: format!("SSE stream error: {}", super::sse_error_without_url(e)),
+                        reason: format!("SSE stream error: {}", super::sse_error_text(e)),
                     });
                 }
             }

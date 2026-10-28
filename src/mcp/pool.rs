@@ -51,9 +51,9 @@ impl McpPool {
         let client: Box<dyn McpClient> = match config.transport.as_str() {
             "stdio" => Box::new(StdioMcpClient::new(name, config.clone())),
             "http" => Box::new(HttpMcpClient::new(name, config)?),
-            other => {
+            _ => {
                 return Err(CoreError::Mcp {
-                    reason: format!("unknown transport: {}", other),
+                    reason: "unknown transport".to_string(),
                 })
             }
         };
@@ -316,8 +316,8 @@ fn compile_validator(tool: &ToolDefinition) -> Result<Option<JSONSchema>> {
     JSONSchema::options()
         .compile(schema)
         .map(Some)
-        .map_err(|error| CoreError::Mcp {
-            reason: format!("invalid input schema for tool '{}': {}", tool.name, error),
+        .map_err(|_| CoreError::Mcp {
+            reason: format!("invalid input schema for tool '{}'", tool.name),
         })
 }
 
@@ -384,6 +384,14 @@ pub fn sanitize_tool_output(content: &str) -> String {
     result
 }
 
+/// Leading identifier of a `Debug` string, e.g. `Enum` from `Enum { options: .. }`.
+fn keyword_name(debug: &str) -> &str {
+    let end = debug
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(debug.len());
+    &debug[..end]
+}
+
 fn validate_arguments(
     prefixed_name: &str,
     tool: &RegisteredTool,
@@ -398,11 +406,15 @@ fn validate_arguments(
         Err(errors) => errors
             .take(5)
             .map(|error| {
+                // Field path and failed keyword only: the message quotes the
+                // rejected value.
+                let debug = format!("{:?}", error.kind);
+                let rule = keyword_name(&debug);
                 let path = error.instance_path.to_string();
                 if path.is_empty() {
-                    error.to_string()
+                    format!("{rule} failed")
                 } else {
-                    format!("{}: {}", path, error)
+                    format!("{path}: {rule} failed")
                 }
             })
             .collect::<Vec<_>>()

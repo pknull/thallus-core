@@ -20,31 +20,24 @@ use crate::config::LlmConfig;
 use crate::error::{CoreError, Result};
 use crate::mcp::LlmTool;
 
-/// Maximum length for API error response bodies in error messages.
-/// Prevents leaking large response bodies that may contain sensitive information.
-pub(crate) const MAX_ERROR_BODY_LENGTH: usize = 256;
-
-/// Truncate an error response body to prevent leaking large/sensitive content.
-pub(crate) fn truncate_error_body(body: &str) -> String {
-    if body.len() <= MAX_ERROR_BODY_LENGTH {
-        body.to_string()
-    } else {
-        // Find safe UTF-8 boundary for truncation
-        let mut end = MAX_ERROR_BODY_LENGTH;
-        while end > 0 && !body.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}... [truncated]", &body[..end])
-    }
-}
-
-/// Drop the request URL, which can carry credentials, from an SSE stream error.
-pub(crate) fn sse_error_without_url(err: reqwest_eventsource::Error) -> reqwest_eventsource::Error {
+/// Safe text for an SSE stream error: the variant and, where one exists, a
+/// status code. Header values, parser input and request URLs can all carry
+/// credentials or response text, so none of them are formatted.
+pub(crate) fn sse_error_text(err: reqwest_eventsource::Error) -> String {
+    use reqwest_eventsource::Error;
     match err {
-        reqwest_eventsource::Error::Transport(e) => {
-            reqwest_eventsource::Error::Transport(e.without_url())
+        Error::Utf8(_) => "stream is not valid UTF-8".to_string(),
+        Error::Parser(_) => "malformed event stream".to_string(),
+        Error::Transport(e) => crate::error::http_error_text(e),
+        Error::InvalidContentType(..) => "unexpected content type".to_string(),
+        Error::InvalidStatusCode(code, _) => {
+            format!(
+                "unexpected status {}",
+                crate::error::status_text(code.as_u16())
+            )
         }
-        other => other,
+        Error::InvalidLastEventId(_) => "invalid Last-Event-ID".to_string(),
+        Error::StreamEnded => "stream ended".to_string(),
     }
 }
 
@@ -330,8 +323,8 @@ pub fn create_provider(config: &LlmConfig) -> Result<Box<dyn Provider>> {
         "anthropic" => Ok(Box::new(AnthropicProvider::new(config)?)),
         "openai" | "ollama" | "openai-compat" => Ok(Box::new(OpenAiCompatProvider::new(config)?)),
         "mock" => Ok(Box::new(MockProvider::new(config)?)),
-        other => Err(CoreError::Provider {
-            reason: format!("unknown provider: {}", other),
+        _ => Err(CoreError::Provider {
+            reason: "unknown provider".to_string(),
         }),
     }
 }
@@ -339,6 +332,14 @@ pub fn create_provider(config: &LlmConfig) -> Result<Box<dyn Provider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_error_text_omits_retained_strings() {
+        let text = sse_error_text(reqwest_eventsource::Error::InvalidLastEventId(
+            "LEAK-id".into(),
+        ));
+        assert!(!text.contains("LEAK"), "{text}");
+    }
 
     #[test]
     fn message_construction() {

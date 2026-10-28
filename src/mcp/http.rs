@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 
 use crate::config::McpServerConfig;
-use crate::error::{CoreError, Result};
+use crate::error::{http_error_text, json_error_text, status_text, CoreError, Result};
 use crate::mcp::client::*;
 
 /// MCP client using HTTP transport.
@@ -52,17 +52,17 @@ impl HttpMcpClient {
             .send()
             .await
             .map_err(|e| CoreError::Mcp {
-                reason: format!("HTTP request failed: {}", e.without_url()),
+                reason: format!("HTTP request failed: {}", http_error_text(e)),
             })?;
 
         if !response.status().is_success() {
             return Err(CoreError::Mcp {
-                reason: format!("HTTP error: {}", response.status()),
+                reason: format!("HTTP error: {}", status_text(response.status().as_u16())),
             });
         }
 
         let rpc_response: JsonRpcResponse = response.json().await.map_err(|e| CoreError::Mcp {
-            reason: format!("failed to parse response: {}", e.without_url()),
+            reason: format!("failed to parse response: {}", http_error_text(e)),
         })?;
 
         if rpc_response.id != id {
@@ -76,7 +76,7 @@ impl HttpMcpClient {
 
         if let Some(error) = rpc_response.error {
             return Err(CoreError::Mcp {
-                reason: format!("MCP error {}: {}", error.code, error.message),
+                reason: format!("MCP error {} from {}", error.code, method),
             });
         }
 
@@ -85,7 +85,11 @@ impl HttpMcpClient {
         })?;
 
         serde_json::from_value(result).map_err(|e| CoreError::Mcp {
-            reason: format!("failed to parse result: {}", e),
+            reason: format!(
+                "failed to decode {} result: {}",
+                method,
+                json_error_text(&e)
+            ),
         })
     }
 }

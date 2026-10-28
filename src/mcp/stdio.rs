@@ -13,7 +13,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::config::McpServerConfig;
-use crate::error::{CoreError, Result};
+use crate::error::{json_error_text, CoreError, Result};
 use crate::mcp::client::*;
 
 /// MCP client using stdio transport (subprocess).
@@ -132,11 +132,7 @@ impl StdioMcpClient {
 
         let response: JsonRpcResponse =
             serde_json::from_str(&line).map_err(|e| CoreError::Mcp {
-                reason: format!(
-                    "failed to parse MCP response: {} (line: {})",
-                    e,
-                    line.trim()
-                ),
+                reason: format!("failed to parse MCP response: {}", json_error_text(&e)),
             })?;
 
         if response.id != id {
@@ -147,7 +143,7 @@ impl StdioMcpClient {
 
         if let Some(error) = response.error {
             return Err(CoreError::Mcp {
-                reason: format!("MCP error {}: {}", error.code, error.message),
+                reason: format!("MCP error {} from {}", error.code, method),
             });
         }
 
@@ -156,7 +152,11 @@ impl StdioMcpClient {
         })?;
 
         serde_json::from_value(result).map_err(|e| CoreError::Mcp {
-            reason: format!("failed to parse MCP result: {}", e),
+            reason: format!(
+                "failed to decode {} result: {}",
+                method,
+                json_error_text(&e)
+            ),
         })
     }
 

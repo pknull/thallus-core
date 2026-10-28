@@ -35,7 +35,7 @@ impl AnthropicProvider {
             })?;
 
         let api_key = std::env::var(api_key_env).map_err(|_| CoreError::Config {
-            reason: format!("environment variable {} not set", api_key_env),
+            reason: "environment variable named by api_key_env is not set".to_string(),
         })?;
 
         Ok(Self {
@@ -60,7 +60,10 @@ impl AnthropicProvider {
                 .json(body)
                 .build()
                 .map_err(|e| CoreError::Provider {
-                    reason: format!("failed to build request: {}", e.without_url()),
+                    reason: format!(
+                        "failed to build request: {}",
+                        crate::error::http_error_text(e)
+                    ),
                 })
         })
         .await
@@ -134,8 +137,8 @@ impl AnthropicProvider {
             .header("content-type", "application/json")
             .json(&body);
 
-        let mut es = request.eventsource().map_err(|e| CoreError::Provider {
-            reason: format!("failed to create event source: {}", e),
+        let mut es = request.eventsource().map_err(|_| CoreError::Provider {
+            reason: "failed to create event source".into(),
         })?;
 
         // Accumulator state
@@ -268,7 +271,7 @@ impl AnthropicProvider {
                 Err(e) => {
                     es.close();
                     return Err(CoreError::Provider {
-                        reason: format!("SSE stream error: {}", super::sse_error_without_url(e)),
+                        reason: format!("SSE stream error: {}", super::sse_error_text(e)),
                     });
                 }
             }
