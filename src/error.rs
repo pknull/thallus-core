@@ -16,7 +16,7 @@ pub enum CoreError {
     #[error("MCP server '{name}' not found")]
     McpServerNotFound { name: String },
 
-    #[error("Invalid arguments for MCP tool '{tool}': {reason}")]
+    #[error("Invalid arguments for MCP {tool}: {reason}")]
     McpValidation { tool: String, reason: String },
 
     #[error("LLM provider error: {reason}")]

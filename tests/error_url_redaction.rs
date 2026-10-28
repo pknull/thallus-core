@@ -781,6 +781,12 @@ async fn pool_with_tools(tools: Vec<serde_json::Value>) -> Result<McpPool, CoreE
     let port = serve(move |req| {
         let result = match req["method"].as_str() {
             Some("tools/list") => serde_json::json!({ "tools": tools }),
+            Some("tools/call") => {
+                return json_ok(&serde_json::json!({
+                    "jsonrpc": "2.0", "id": rpc_id(&req),
+                    "error": {"code": -32000, "message": "boom"}
+                }))
+            }
             _ => init_result("s", "1"),
         };
         json_ok(&serde_json::json!({"jsonrpc": "2.0", "id": rpc_id(&req), "result": result}))
@@ -1158,4 +1164,148 @@ async fn anthropic_stream_does_not_forward_key_on_redirect() {
 
     let seen = seen.lock().unwrap().join("\n");
     assert!(!seen.contains(REDIRECT_KEY), "key forwarded: {seen}");
+}
+
+// ---------------------------------------------------------------------------
+// Review round 3: generated tool identity, draft-aware declaration walk.
+// ---------------------------------------------------------------------------
+
+fn secret_identifier_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "LEAK-7c1d",
+        "inputSchema": {"type": "object", "properties": {"n": {"type": "integer"}}}
+    })
+}
+
+#[tokio::test]
+async fn accepted_secret_identifier_stays_out_of_validation_diagnostics() {
+    let pool = pool_with_tools(vec![secret_identifier_tool()])
+        .await
+        .unwrap();
+    let (_guard, logs) = capture_logs();
+
+    let err = pool
+        .call_tool("srv_LEAK-7c1d", serde_json::json!({"n": "x"}))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, CoreError::McpValidation { .. }), "{err:?}");
+    for text in [err.to_string(), format!("{err:?}"), format!("{err:#?}")] {
+        assert_no_leak(&text);
+    }
+    assert!(
+        err.to_string().contains("tool #0 from server 'srv'"),
+        "diagnostic identity missing: {err}"
+    );
+    let logs = logs.lock().unwrap().join("\n");
+    assert!(logs.contains("rejected"), "{logs}");
+    assert_no_leak(&logs);
+}
+
+#[tokio::test]
+async fn accepted_secret_identifier_stays_out_of_circuit_breaker_diagnostics() {
+    let pool = pool_with_tools(vec![secret_identifier_tool()])
+        .await
+        .unwrap();
+    let (_guard, logs) = capture_logs();
+
+    let mut last = None;
+    for _ in 0..6 {
+        last = Some(
+            pool.call_tool("srv_LEAK-7c1d", serde_json::json!({"n": 1}))
+                .await
+                .unwrap_err(),
+        );
+    }
+
+    let err = last.unwrap();
+    assert!(err.to_string().contains("circuit breaker open"), "{err}");
+    for text in [err.to_string(), format!("{err:?}")] {
+        assert_no_leak(&text);
+    }
+    let logs = logs.lock().unwrap().join("\n");
+    assert!(logs.contains("circuit breaker open"), "{logs}");
+    assert_no_leak(&logs);
+}
+
+/// A schema whose root rejects every key, plus `ignored` which the compiler of
+/// the draft named by `schema_uri` does not apply.
+fn schema_with_ignored(
+    schema_uri: Option<&str>,
+    keyword: &str,
+    value: serde_json::Value,
+) -> serde_json::Value {
+    let mut schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": {"type": "integer"}
+    });
+    schema[keyword] = value;
+    if let Some(uri) = schema_uri {
+        schema["$schema"] = uri.into();
+    }
+    schema
+}
+
+#[tokio::test]
+async fn keywords_the_compiler_draft_ignores_do_not_declare_names() {
+    let declares = serde_json::json!({"properties": {LEAK: {}}});
+    let draft4 = "http://json-schema.org/draft-04/schema#";
+    let draft6 = "http://json-schema.org/draft-06/schema#";
+    let draft7 = "http://json-schema.org/draft-07/schema#";
+    let newer = "https://json-schema.org/draft/2020-12/schema";
+    let cases: Vec<(Option<&str>, &str, serde_json::Value)> = vec![
+        // Draft 7, by default and explicitly.
+        (None, "prefixItems", serde_json::json!([declares])),
+        (None, "dependentSchemas", serde_json::json!({"k": declares})),
+        (None, "unevaluatedProperties", declares.clone()),
+        (None, "unevaluatedItems", declares.clone()),
+        (None, "$defs", serde_json::json!({"k": declares})),
+        (Some(draft7), "prefixItems", serde_json::json!([declares])),
+        // A draft this build does not enable falls back to Draft 7.
+        (Some(newer), "prefixItems", serde_json::json!([declares])),
+        // Draft 6 has no if/then/else.
+        (Some(draft6), "if", declares.clone()),
+        (Some(draft6), "then", declares.clone()),
+        (Some(draft6), "prefixItems", serde_json::json!([declares])),
+        // Draft 4 has no contains, propertyNames or if.
+        (Some(draft4), "contains", declares.clone()),
+        (Some(draft4), "propertyNames", declares.clone()),
+        (Some(draft4), "if", declares.clone()),
+    ];
+    for (uri, keyword, value) in cases {
+        let schema = schema_with_ignored(uri, keyword, value);
+        let (display, debug, logs) = rejection(schema, serde_json::json!({ LEAK: "x" })).await;
+        for text in [&display, &debug, &logs] {
+            assert!(!text.contains(LEAK), "{uri:?} {keyword} leaks: {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn keywords_the_compiler_draft_applies_do_declare_names() {
+    let sub = serde_json::json!({"properties": {"inner": {"type": "integer"}}});
+    let draft4 = "http://json-schema.org/draft-04/schema#";
+    let cases: Vec<(Option<&str>, &str, serde_json::Value, serde_json::Value)> = vec![
+        (None, "if", sub.clone(), serde_json::json!({"inner": "x"})),
+        (
+            Some(draft4),
+            "allOf",
+            serde_json::json!([sub]),
+            serde_json::json!({"inner": "x"}),
+        ),
+    ];
+    for (uri, keyword, value, args) in cases {
+        let mut schema = serde_json::json!({"type": "object"});
+        schema[keyword] = value;
+        if let Some(uri) = uri {
+            schema["$schema"] = uri.into();
+        }
+        if keyword == "if" {
+            schema["then"] = serde_json::json!({"required": ["inner"]});
+            schema["if"] = serde_json::json!({"properties": {"inner": {"type": "integer"}}, "required": ["inner"]});
+            schema["else"] = serde_json::json!({"properties": {"inner": {"type": "integer"}}});
+        }
+        let (display, _, _) = rejection(schema, args).await;
+        assert!(display.contains("/inner: "), "{keyword}: {display}");
+    }
 }

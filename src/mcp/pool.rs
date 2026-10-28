@@ -32,8 +32,18 @@ pub struct McpPool {
 
 struct RegisteredTool {
     server_name: String,
+    /// Position in the server's tool list, for diagnostics.
+    index: usize,
     definition: ToolDefinition,
     validator: Option<JSONSchema>,
+}
+
+impl RegisteredTool {
+    /// Generated identity for diagnostics. The tool's own name came from the
+    /// server and can carry anything an identifier allows, so it is never used.
+    fn label(&self) -> String {
+        format!("tool #{} from server '{}'", self.index, self.server_name)
+    }
 }
 
 impl McpPool {
@@ -110,6 +120,7 @@ impl McpPool {
                     prefixed_name,
                     RegisteredTool {
                         server_name: name.clone(),
+                        index,
                         definition: tool,
                         validator,
                     },
@@ -198,7 +209,7 @@ impl McpPool {
             if !cb.should_allow() {
                 tracing::warn!(
                     server = %server_name,
-                    tool = %prefixed_name,
+                    tool = %tool.label(),
                     "circuit breaker open, rejecting call"
                 );
                 return Err(CoreError::Mcp {
@@ -210,7 +221,7 @@ impl McpPool {
             }
         }
 
-        validate_arguments(prefixed_name, tool, &arguments)?;
+        validate_arguments(tool, &arguments)?;
 
         let client = self
             .clients
@@ -534,70 +545,113 @@ fn is_valid_tool_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
+/// The schema drafts this build compiles; see `draft_of`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Draft {
+    Four,
+    Six,
+    Seven,
+}
+
+/// The draft jsonschema 0.18 compiles `schema` with: the `$schema` URL (a
+/// trailing `#` ignored) when it names an enabled draft, else Draft 7. The
+/// 2019-09 and 2020-12 drafts sit behind crate features this crate does not
+/// enable, so their URLs also fall back to Draft 7.
+fn draft_of(schema: &serde_json::Value) -> Draft {
+    match schema
+        .get("$schema")
+        .and_then(serde_json::Value::as_str)
+        .map(|url| url.trim_end_matches('#'))
+    {
+        Some("http://json-schema.org/draft-06/schema") => Draft::Six,
+        Some("http://json-schema.org/draft-04/schema") => Draft::Four,
+        _ => Draft::Seven,
+    }
+}
+
 /// Property names the tool's schema declares.
 ///
-/// Only real schema positions are visited. Annotation and data keywords
-/// (`default`, `examples`, `const`, `enum`, `title`, `description`) and unknown
-/// keywords are never entered. `$ref` is not followed; an object with a `$ref`
-/// contributes only its `$defs`/`definitions`, since draft 7 ignores siblings.
+/// Only the applicator keywords of the draft the compiler uses are entered.
+/// Keywords that draft ignores, annotation and data keywords (`default`,
+/// `examples`, `const`, `enum`, `title`, `description`) and unknown keywords
+/// are never visited. `$ref` is not followed; an object with a string `$ref`
+/// contributes only its `definitions`, since these drafts ignore siblings.
 fn declared_names(root: &serde_json::Value) -> HashSet<&str> {
     use serde_json::Value;
 
-    fn each_value<'a>(value: &'a Value, out: &mut HashSet<&'a str>) {
-        if let Value::Object(map) = value {
-            map.values().for_each(|v| schema(v, out));
+    struct Walk<'a> {
+        draft: Draft,
+        out: HashSet<&'a str>,
+    }
+
+    impl<'a> Walk<'a> {
+        fn each_value(&mut self, value: &'a Value) {
+            if let Value::Object(map) = value {
+                for v in map.values() {
+                    self.schema(v);
+                }
+            }
+        }
+
+        fn schema(&mut self, value: &'a Value) {
+            let Value::Object(map) = value else {
+                return;
+            };
+            if let Some(defs) = map.get("definitions") {
+                self.each_value(defs);
+            }
+            if map.get("$ref").is_some_and(Value::is_string) {
+                return;
+            }
+            if let Some(Value::Object(props)) = map.get("properties") {
+                self.out.extend(props.keys().map(String::as_str));
+                for v in props.values() {
+                    self.schema(v);
+                }
+            }
+            if let Some(group) = map.get("patternProperties") {
+                self.each_value(group);
+            }
+            // `dependencies` values are schemas or property lists; lists are
+            // not objects and are skipped.
+            if let Some(Value::Object(deps)) = map.get("dependencies") {
+                for v in deps.values() {
+                    self.schema(v);
+                }
+            }
+            let mut single = vec!["additionalProperties", "additionalItems"];
+            if self.draft >= Draft::Six {
+                single.extend(["contains", "propertyNames"]);
+            }
+            if self.draft >= Draft::Seven {
+                single.extend(["if", "then", "else"]);
+            }
+            single.push("not");
+            for key in single {
+                if let Some(sub) = map.get(key) {
+                    self.schema(sub);
+                }
+            }
+            for key in ["items", "allOf", "anyOf", "oneOf"] {
+                match map.get(key) {
+                    Some(Value::Array(subs)) => {
+                        for v in subs {
+                            self.schema(v);
+                        }
+                    }
+                    Some(sub) => self.schema(sub),
+                    None => {}
+                }
+            }
         }
     }
 
-    fn schema<'a>(value: &'a Value, out: &mut HashSet<&'a str>) {
-        let Value::Object(map) = value else {
-            return;
-        };
-        for key in ["$defs", "definitions"] {
-            if let Some(defs) = map.get(key) {
-                each_value(defs, out);
-            }
-        }
-        if map.get("$ref").is_some_and(Value::is_string) {
-            return;
-        }
-        if let Some(Value::Object(props)) = map.get("properties") {
-            out.extend(props.keys().map(String::as_str));
-            props.values().for_each(|v| schema(v, out));
-        }
-        for key in ["patternProperties", "dependentSchemas", "dependencies"] {
-            if let Some(group) = map.get(key) {
-                each_value(group, out);
-            }
-        }
-        for key in [
-            "additionalProperties",
-            "additionalItems",
-            "contains",
-            "propertyNames",
-            "not",
-            "if",
-            "then",
-            "else",
-            "unevaluatedProperties",
-            "unevaluatedItems",
-        ] {
-            if let Some(sub) = map.get(key) {
-                schema(sub, out);
-            }
-        }
-        for key in ["items", "prefixItems", "allOf", "anyOf", "oneOf"] {
-            match map.get(key) {
-                Some(Value::Array(subs)) => subs.iter().for_each(|v| schema(v, out)),
-                Some(sub) => schema(sub, out),
-                None => {}
-            }
-        }
-    }
-
-    let mut out = HashSet::new();
-    schema(root, &mut out);
-    out
+    let mut walk = Walk {
+        draft: draft_of(root),
+        out: HashSet::new(),
+    };
+    walk.schema(root);
+    walk.out
 }
 
 /// Render a JSON pointer keeping array indices, schema keywords and declared
@@ -626,11 +680,7 @@ fn render_path(path: &jsonschema::paths::JSONPointer, declared: &HashSet<&str>) 
     out
 }
 
-fn validate_arguments(
-    prefixed_name: &str,
-    tool: &RegisteredTool,
-    arguments: &serde_json::Value,
-) -> Result<()> {
+fn validate_arguments(tool: &RegisteredTool, arguments: &serde_json::Value) -> Result<()> {
     let Some(validator) = tool.validator.as_ref() else {
         return Ok(());
     };
@@ -658,9 +708,10 @@ fn validate_arguments(
             .join("; "),
     };
 
-    tracing::warn!(tool = prefixed_name, reason = %details, "rejected MCP tool call");
+    let label = tool.label();
+    tracing::warn!(tool = %label, reason = %details, "rejected MCP tool call");
     Err(CoreError::McpValidation {
-        tool: prefixed_name.to_string(),
+        tool: label,
         reason: details,
     })
 }
@@ -741,6 +792,7 @@ mod tests {
             "shell_execute".to_string(),
             RegisteredTool {
                 server_name: "shell".to_string(),
+                index: 0,
                 definition,
                 validator,
             },
@@ -825,6 +877,7 @@ mod tests {
             "failing_test".to_string(),
             RegisteredTool {
                 server_name: "failing".to_string(),
+                index: 0,
                 definition,
                 validator: None,
             },
