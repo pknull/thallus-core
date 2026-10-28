@@ -152,10 +152,10 @@ impl PublicId {
             .strip_prefix('@')
             .and_then(|s| s.strip_suffix(".ed25519"))
             .ok_or_else(|| CoreError::InvalidKeypair {
-                reason: format!("invalid public ID format: {}", self.0),
+                reason: "invalid public ID format".into(),
             })?;
-        let bytes = B64.decode(inner).map_err(|e| CoreError::InvalidKeypair {
-            reason: format!("base64 decode failed: {e}"),
+        let bytes = B64.decode(inner).map_err(|_| CoreError::InvalidKeypair {
+            reason: "base64 decode failed".into(),
         })?;
         let key_bytes: [u8; 32] = bytes.try_into().map_err(|_| CoreError::InvalidKeypair {
             reason: "expected 32 bytes after decode".into(),
@@ -170,8 +170,8 @@ impl PublicId {
         let vk = self.to_verifying_key()?;
         let sig_bytes = B64
             .decode(signature_b64)
-            .map_err(|e| CoreError::InvalidKeypair {
-                reason: format!("signature base64 decode failed: {e}"),
+            .map_err(|_| CoreError::InvalidKeypair {
+                reason: "signature base64 decode failed".into(),
             })?;
         let sig_bytes: [u8; 64] = sig_bytes
             .try_into()

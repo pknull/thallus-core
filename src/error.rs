@@ -29,11 +29,17 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
 
     #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(JsonError),
 
     /// Built through `From<reqwest::Error>`, which keeps only bounded facts.
     #[error("HTTP error: {0}")]
     Http(HttpError),
+}
+
+impl From<serde_json::Error> for CoreError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Json(JsonError::from(err))
+    }
 }
 
 impl From<reqwest::Error> for CoreError {
@@ -182,15 +188,113 @@ pub(crate) fn http_error_text(err: reqwest::Error) -> String {
     HttpError::from(err).to_string()
 }
 
-/// Bounded description of a serde_json error: its category and position,
-/// never its message, which can quote the offending value.
+/// A JSON failure reduced to its category and position.
+///
+/// serde messages quote the offending value, so the message, the source and
+/// the value are dropped. The fields are private and the only constructor is
+/// `From<serde_json::Error>`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct JsonError {
+    category: JsonCategory,
+    line: usize,
+    column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonCategory {
+    Io,
+    Syntax,
+    Data,
+    Eof,
+}
+
+impl JsonError {
+    /// The input was not syntactically valid JSON.
+    #[must_use]
+    pub fn is_syntax(&self) -> bool {
+        self.category == JsonCategory::Syntax
+    }
+
+    /// The input was valid JSON but did not match the target type.
+    #[must_use]
+    pub fn is_data(&self) -> bool {
+        self.category == JsonCategory::Data
+    }
+
+    /// The input ended early.
+    #[must_use]
+    pub fn is_eof(&self) -> bool {
+        self.category == JsonCategory::Eof
+    }
+
+    /// An I/O failure while reading or writing.
+    #[must_use]
+    pub fn is_io(&self) -> bool {
+        self.category == JsonCategory::Io
+    }
+
+    /// One-based line of the failure, or 0 when unknown.
+    #[must_use]
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
+    /// One-based column of the failure, or 0 when unknown.
+    #[must_use]
+    pub fn column(&self) -> usize {
+        self.column
+    }
+}
+
+impl From<&serde_json::Error> for JsonError {
+    fn from(err: &serde_json::Error) -> Self {
+        use serde_json::error::Category;
+        let category = match err.classify() {
+            Category::Io => JsonCategory::Io,
+            Category::Syntax => JsonCategory::Syntax,
+            Category::Data => JsonCategory::Data,
+            Category::Eof => JsonCategory::Eof,
+        };
+        Self {
+            category,
+            line: err.line(),
+            column: err.column(),
+        }
+    }
+}
+
+impl From<serde_json::Error> for JsonError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::from(&err)
+    }
+}
+
+impl std::fmt::Display for JsonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} error at line {} column {}",
+            self.category, self.line, self.column
+        )
+    }
+}
+
+impl std::fmt::Debug for JsonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonError")
+            .field("category", &self.category)
+            .field("line", &self.line)
+            .field("column", &self.column)
+            .finish()
+    }
+}
+
+/// No `source()`: the wrapped `serde_json::Error` is dropped on conversion.
+impl std::error::Error for JsonError {}
+
+/// Bounded description of a serde_json error.
 pub(crate) fn json_error_text(err: &serde_json::Error) -> String {
-    format!(
-        "{:?} error at line {} column {}",
-        err.classify(),
-        err.line(),
-        err.column()
-    )
+    JsonError::from(err).to_string()
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

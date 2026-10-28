@@ -111,8 +111,6 @@ impl McpClient for HttpMcpClient {
 
         tracing::info!(
             name = %self.name,
-            server = %result.server_info.name,
-            version = %result.server_info.version,
             "initialized HTTP MCP server"
         );
 

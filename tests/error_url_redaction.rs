@@ -625,13 +625,18 @@ fn missing_api_key_env_name_is_not_echoed() {
 }
 
 #[test]
-fn config_debug_redacts_urls_and_secrets() {
+fn config_debug_redacts_every_free_text_field() {
     let url = "http://alice:s3cret@host/private-path?token=tok-9f2";
     let mut mcp = http_mcp(1);
+    mcp.transport = format!("{LEAK}-{url}");
+    mcp.command = Some(format!("{LEAK}-cmd"));
     mcp.url = Some(url.into());
-    mcp.env.insert("API_KEY".into(), LEAK.into());
+    mcp.env.insert(format!("{LEAK}_ENV_NAME"), LEAK.into());
     mcp.args = vec![format!("--token={LEAK}")];
-    let llm = openai_compat(url);
+    let mut llm = openai_compat(url);
+    llm.provider = format!("{LEAK}-{url}");
+    llm.model = format!("{LEAK}-model");
+    llm.api_key_env = Some(format!("{LEAK}_KEY"));
 
     for text in [
         format!("{mcp:?}"),
@@ -642,25 +647,270 @@ fn config_debug_redacts_urls_and_secrets() {
         assert_no_url(&text, url);
         assert_no_leak(&text);
     }
-    assert!(
-        format!("{mcp:?}").contains("API_KEY"),
-        "env key names stay visible"
-    );
+}
+
+#[test]
+fn config_debug_keeps_known_selectors_and_counts() {
+    let mut mcp = http_mcp(1);
+    mcp.env.insert("A".into(), "x".into());
+    mcp.env.insert("B".into(), "y".into());
+    let llm = openai_compat("http://h");
+
+    let mcp = format!("{mcp:?}");
+    let llm = format!("{llm:?}");
+
+    assert!(mcp.contains("http"), "{mcp}");
+    assert!(mcp.contains('2'), "env count lost: {mcp}");
+    assert!(llm.contains("openai-compat"), "{llm}");
+}
+
+fn anthropic(base_url: &str, key_env: &str) -> LlmConfig {
+    std::env::set_var(key_env, "test-key");
+    LlmConfig {
+        provider: "anthropic".into(),
+        api_key_env: Some(key_env.into()),
+        ..openai_compat(base_url)
+    }
 }
 
 #[tokio::test]
-async fn anthropic_build_error_omits_key() {
-    std::env::set_var("THALLUS_TEST_ANTHROPIC_KEY", format!("{LEAK}\nbad"));
-    let mut config = openai_compat("http://127.0.0.1:1");
-    config.provider = "anthropic".into();
-    config.api_key_env = Some("THALLUS_TEST_ANTHROPIC_KEY".into());
-    let provider = create_provider(&config).unwrap();
+async fn anthropic_build_error_omits_url() {
+    let url = "data:alice-s3cret?token=tok-9f2";
+    let provider = create_provider(&anthropic(url, "THALLUS_TEST_KEY_BUILD")).unwrap();
 
     let err = provider
         .chat("", &[Message::user("hi")], &[])
         .await
         .unwrap_err();
 
-    assert_no_leak(&err.to_string());
+    assert_no_url(&err.to_string(), url);
     assert!(err.to_string().contains("builder error"), "{err}");
+}
+
+#[tokio::test]
+async fn anthropic_request_error_omits_url() {
+    let url = secret_url(closed_port());
+    let provider = create_provider(&anthropic(&url, "THALLUS_TEST_KEY_REQ")).unwrap();
+
+    let err = provider
+        .chat("", &[Message::user("hi")], &[])
+        .await
+        .unwrap_err();
+
+    assert_no_url(&err.to_string(), &url);
+    assert!(err.to_string().contains("error sending request"), "{err}");
+}
+
+#[tokio::test]
+async fn anthropic_stream_transport_error_omits_url() {
+    let url = secret_url(closed_port());
+    let provider = create_provider(&anthropic(&url, "THALLUS_TEST_KEY_SSE")).unwrap();
+
+    let err = provider
+        .chat_stream("", &[Message::user("hi")], &[], &|_: StreamEvent| {})
+        .await
+        .unwrap_err();
+
+    assert_no_url(&err.to_string(), &url);
+    assert!(err.to_string().contains("error sending request"), "{err}");
+}
+
+#[tokio::test]
+async fn anthropic_stream_invalid_content_type_stays_out() {
+    let port = serve(|_| response("200 OK", LEAK, "x")).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let provider = create_provider(&anthropic(&base, "THALLUS_TEST_KEY_CT")).unwrap();
+
+    let err = provider
+        .chat_stream("", &[Message::user("hi")], &[], &|_: StreamEvent| {})
+        .await
+        .unwrap_err();
+
+    assert_no_leak(&err.to_string());
+    assert!(err.to_string().contains("SSE"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Review round: argument keys, response-supplied names, JSON errors.
+// ---------------------------------------------------------------------------
+
+fn init_result(name: &str, version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": "2024-11-05",
+        "serverInfo": {"name": name, "version": version},
+        "capabilities": {}
+    })
+}
+
+/// A pool over a scripted HTTP server exposing one tool `tool_name` with `schema`.
+async fn pool_with_schema(
+    tool_name: &str,
+    schema: serde_json::Value,
+) -> Result<McpPool, CoreError> {
+    let tool_name = tool_name.to_string();
+    let port = serve(move |req| {
+        let result = match req["method"].as_str() {
+            Some("tools/list") => {
+                serde_json::json!({"tools": [{"name": tool_name, "inputSchema": schema}]})
+            }
+            _ => init_result("s", "1"),
+        };
+        json_ok(&serde_json::json!({"jsonrpc": "2.0", "id": rpc_id(&req), "result": result}))
+    })
+    .await;
+    let mut pool = McpPool::new();
+    pool.add_client("srv", &http_mcp(port)).unwrap();
+    pool.initialize_all().await?;
+    Ok(pool)
+}
+
+#[tokio::test]
+async fn validation_path_replaces_undeclared_keys() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "known": {"type": "object", "additionalProperties": {"type": "integer"}},
+            "pat": {"type": "object", "patternProperties": {"^x": {"type": "integer"}}},
+            "list": {"type": "array", "items": {
+                "type": "object", "additionalProperties": {"type": "integer"}}}
+        },
+        "additionalProperties": {"type": "integer"}
+    });
+    let pool = pool_with_schema("run", schema).await.unwrap();
+    let (_guard, logs) = capture_logs();
+    let key = format!("x-{LEAK}");
+
+    let cases = [
+        (serde_json::json!({ (key.clone()): "s" }), "/<key>"),
+        (
+            serde_json::json!({"known": { (key.clone()): "s" }}),
+            "/known/<key>",
+        ),
+        (
+            serde_json::json!({"pat": { (key.clone()): "s" }}),
+            "/pat/<key>",
+        ),
+        (
+            serde_json::json!({"list": [{ (key.clone()): "s" }]}),
+            "/list/0/<key>",
+        ),
+    ];
+    for (args, expected) in cases {
+        let err = pool.call_tool("srv_run", args).await.unwrap_err();
+        for text in [err.to_string(), format!("{err:?}"), format!("{err:#?}")] {
+            assert_no_leak(&text);
+        }
+        assert!(
+            err.to_string().contains(expected),
+            "{expected} missing: {err}"
+        );
+    }
+    let logs = logs.lock().unwrap().join("\n");
+    assert!(logs.contains("rejected"), "{logs}");
+    assert_no_leak(&logs);
+}
+
+#[tokio::test]
+async fn schema_compile_error_is_bounded_and_actionable() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"mode": {"type": 5}}
+    });
+    let tool = format!("{LEAK}-http://alice:s3cret@h/p?token=tok-9f2");
+    let (_guard, logs) = capture_logs();
+
+    let err = pool_with_schema(&tool, schema)
+        .await
+        .err()
+        .expect("must fail");
+
+    let text = err.to_string();
+    assert_no_leak(&text);
+    assert_no_url(&text, SERVER_URL);
+    assert!(text.contains("srv"), "configured server name lost: {text}");
+    assert!(
+        text.contains("/properties/mode/type"),
+        "location lost: {text}"
+    );
+    assert_no_leak(&logs.lock().unwrap().join("\n"));
+    assert_no_leak(&format!("{err:?}"));
+}
+
+#[tokio::test]
+async fn schema_compile_error_location_hides_undeclared_keys() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "patternProperties": {(format!("^{LEAK}")): {"type": 5}}
+    });
+
+    let err = pool_with_schema("run", schema)
+        .await
+        .err()
+        .expect("must fail");
+
+    assert_no_leak(&err.to_string());
+}
+
+#[tokio::test]
+async fn http_init_log_omits_server_supplied_identity() {
+    let port = serve(|req| {
+        json_ok(&serde_json::json!({
+            "jsonrpc": "2.0", "id": rpc_id(&req), "result": init_result(LEAK, LEAK)
+        }))
+    })
+    .await;
+    let mut client = HttpMcpClient::new("srv", &http_mcp(port)).unwrap();
+    let (_guard, logs) = capture_logs();
+
+    client.initialize().await.unwrap();
+
+    let logs = logs.lock().unwrap().join("\n");
+    assert!(logs.contains("initialized"), "not captured: {logs}");
+    assert!(logs.contains("srv"), "configured name lost: {logs}");
+    assert_no_leak(&logs);
+}
+
+#[tokio::test]
+async fn stdio_init_log_omits_server_supplied_identity() {
+    let script = format!(
+        r#"read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"x","serverInfo":{{"name":"{LEAK}","version":"{LEAK}"}}}}}}'; read l"#
+    );
+    let mut client = StdioMcpClient::new("srv", sh_mcp(&script));
+    let (_guard, logs) = capture_logs();
+
+    let result = client.initialize().await;
+    let _ = client.shutdown().await;
+
+    result.unwrap();
+    let logs = logs.lock().unwrap().join("\n");
+    assert!(logs.contains("initialized"), "not captured: {logs}");
+    assert_no_leak(&logs);
+}
+
+#[test]
+fn json_error_conversion_stays_out() {
+    let source = serde_json::from_str::<Vec<u8>>(&format!("\"{LEAK}\"")).unwrap_err();
+    assert!(
+        source.to_string().contains(LEAK),
+        "fixture must quote the value"
+    );
+
+    let err = CoreError::from(source);
+
+    for text in [err.to_string(), format!("{err:?}"), format!("{err:#?}")] {
+        assert_no_leak(&text);
+    }
+    assert!(std::error::Error::source(&err).is_none());
+    assert!(err.to_string().contains("line 1"), "position lost: {err}");
+}
+
+#[test]
+fn invalid_public_id_is_not_echoed() {
+    let id = thallus_core::PublicId(format!("{LEAK}-http://alice:s3cret@h/p?token=tok-9f2"));
+    let err = id.to_verifying_key().unwrap_err();
+    assert_no_leak(&err.to_string());
+
+    let id = thallus_core::PublicId(format!("@{LEAK}!.ed25519"));
+    let err = id.to_verifying_key().unwrap_err();
+    assert_no_leak(&err.to_string());
 }

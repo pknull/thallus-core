@@ -210,8 +210,6 @@ impl McpClient for StdioMcpClient {
 
         tracing::info!(
             name = %self.name,
-            server = %result.server_info.name,
-            version = %result.server_info.version,
             "initialized MCP server"
         );
 

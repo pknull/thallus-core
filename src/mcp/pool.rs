@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use jsonschema::error::ValidationErrorKind;
 use jsonschema::JSONSchema;
 use tokio::sync::RwLock;
 
@@ -95,9 +96,9 @@ impl McpPool {
 
             // List and register tools
             let tools = client.list_tools().await?;
-            for tool in tools {
+            for (index, tool) in tools.into_iter().enumerate() {
                 let prefixed_name = tool.prefixed_name(&name);
-                let validator = compile_validator(&tool)?;
+                let validator = compile_validator(&name, index, &tool)?;
                 self.tools.insert(
                     prefixed_name,
                     RegisteredTool {
@@ -308,7 +309,11 @@ pub struct LlmTool {
     pub input_schema: serde_json::Value,
 }
 
-fn compile_validator(tool: &ToolDefinition) -> Result<Option<JSONSchema>> {
+fn compile_validator(
+    server: &str,
+    index: usize,
+    tool: &ToolDefinition,
+) -> Result<Option<JSONSchema>> {
     let Some(schema) = tool.input_schema.as_ref() else {
         return Ok(None);
     };
@@ -316,8 +321,22 @@ fn compile_validator(tool: &ToolDefinition) -> Result<Option<JSONSchema>> {
     JSONSchema::options()
         .compile(schema)
         .map(Some)
-        .map_err(|_| CoreError::Mcp {
-            reason: format!("invalid input schema for tool '{}'", tool.name),
+        .map_err(|error| {
+            // The server's tool name and the schema's own text are response
+            // data; report the configured server, the tool's position, the
+            // failed rule and its location.
+            let mut reason = format!(
+                "invalid input schema for tool #{index} from server '{server}': {}",
+                rule_name(&error.kind)
+            );
+            if let ValidationErrorKind::Type { kind } = &error.kind {
+                reason.push_str(&format!(" (expected {})", type_kind_text(kind)));
+            }
+            reason.push_str(&format!(
+                " at {}",
+                render_path(&error.instance_path, &declared_names(schema))
+            ));
+            CoreError::Mcp { reason }
         })
 }
 
@@ -384,12 +403,153 @@ pub fn sanitize_tool_output(content: &str) -> String {
     result
 }
 
-/// Leading identifier of a `Debug` string, e.g. `Enum` from `Enum { options: .. }`.
-fn keyword_name(debug: &str) -> &str {
-    let end = debug
-        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .unwrap_or(debug.len());
-    &debug[..end]
+/// The failed JSON Schema rule as fixed text; no payload is read.
+fn rule_name(kind: &ValidationErrorKind) -> &'static str {
+    use ValidationErrorKind as K;
+    match kind {
+        K::AdditionalItems { .. } => "additionalItems",
+        K::AdditionalProperties { .. } => "additionalProperties",
+        K::AnyOf => "anyOf",
+        K::BacktrackLimitExceeded { .. } => "backtrackLimitExceeded",
+        K::Constant { .. } => "const",
+        K::Contains => "contains",
+        K::ContentEncoding { .. } => "contentEncoding",
+        K::ContentMediaType { .. } => "contentMediaType",
+        K::Custom { .. } => "custom",
+        K::Enum { .. } => "enum",
+        K::ExclusiveMaximum { .. } => "exclusiveMaximum",
+        K::ExclusiveMinimum { .. } => "exclusiveMinimum",
+        K::FalseSchema => "falseSchema",
+        K::FileNotFound { .. } => "fileNotFound",
+        K::Format { .. } => "format",
+        K::FromUtf8 { .. } => "fromUtf8",
+        K::Utf8 { .. } => "utf8",
+        K::JSONParse { .. } => "jsonParse",
+        K::InvalidReference { .. } => "invalidReference",
+        K::InvalidURL { .. } => "invalidUrl",
+        K::MaxItems { .. } => "maxItems",
+        K::Maximum { .. } => "maximum",
+        K::MaxLength { .. } => "maxLength",
+        K::MaxProperties { .. } => "maxProperties",
+        K::MinItems { .. } => "minItems",
+        K::Minimum { .. } => "minimum",
+        K::MinLength { .. } => "minLength",
+        K::MinProperties { .. } => "minProperties",
+        K::MultipleOf { .. } => "multipleOf",
+        K::Not { .. } => "not",
+        K::OneOfMultipleValid => "oneOf (multiple valid)",
+        K::OneOfNotValid => "oneOf (none valid)",
+        K::Pattern { .. } => "pattern",
+        K::PropertyNames { .. } => "propertyNames",
+        K::Required { .. } => "required",
+        K::Schema => "schema",
+        K::Type { .. } => "type",
+        K::UnevaluatedProperties { .. } => "unevaluatedProperties",
+        K::UniqueItems => "uniqueItems",
+        K::UnknownReferenceScheme { .. } => "unknownReferenceScheme",
+        K::Resolver { .. } => "resolver",
+    }
+}
+
+/// The expected JSON type names, e.g. `string` or `string | null`.
+fn type_kind_text(kind: &jsonschema::error::TypeKind) -> String {
+    use jsonschema::error::TypeKind;
+    match kind {
+        TypeKind::Single(t) => t.to_string(),
+        TypeKind::Multiple(set) => set
+            .into_iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(" | "),
+    }
+}
+
+/// JSON Schema keywords that may appear as path segments.
+const SCHEMA_KEYWORDS: &[&str] = &[
+    "$defs",
+    "$id",
+    "$ref",
+    "$schema",
+    "additionalItems",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "contains",
+    "definitions",
+    "dependencies",
+    "else",
+    "if",
+    "items",
+    "not",
+    "oneOf",
+    "patternProperties",
+    "properties",
+    "propertyNames",
+    "then",
+    "const",
+    "enum",
+    "exclusiveMaximum",
+    "exclusiveMinimum",
+    "format",
+    "maxItems",
+    "maxLength",
+    "maxProperties",
+    "maximum",
+    "minItems",
+    "minLength",
+    "minProperties",
+    "minimum",
+    "multipleOf",
+    "pattern",
+    "required",
+    "type",
+    "uniqueItems",
+    "unevaluatedProperties",
+];
+
+/// Property names the tool's schema declares under any `properties`.
+fn declared_names(schema: &serde_json::Value) -> HashSet<&str> {
+    fn walk<'a>(value: &'a serde_json::Value, out: &mut HashSet<&'a str>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Object(props)) = map.get("properties") {
+                    out.extend(props.keys().map(String::as_str));
+                }
+                map.values().for_each(|v| walk(v, out));
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    walk(schema, &mut out);
+    out
+}
+
+/// Render a JSON pointer keeping array indices, schema keywords and declared
+/// property names. Any other object key is caller- or server-supplied data and
+/// becomes `<key>`.
+fn render_path(path: &jsonschema::paths::JSONPointer, declared: &HashSet<&str>) -> String {
+    use jsonschema::paths::PathChunk;
+    let mut out = String::new();
+    for chunk in path {
+        out.push('/');
+        match chunk {
+            PathChunk::Index(i) => out.push_str(&i.to_string()),
+            PathChunk::Keyword(k) => out.push_str(k),
+            PathChunk::Property(name) => {
+                if declared.contains(&**name) || SCHEMA_KEYWORDS.contains(&&**name) {
+                    out.push_str(name);
+                } else {
+                    out.push_str("<key>");
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
 }
 
 fn validate_arguments(
@@ -401,21 +561,24 @@ fn validate_arguments(
         return Ok(());
     };
 
+    let declared = tool
+        .definition
+        .input_schema
+        .as_ref()
+        .map(declared_names)
+        .unwrap_or_default();
     let details = match validator.validate(arguments) {
         Ok(()) => return Ok(()),
         Err(errors) => errors
             .take(5)
             .map(|error| {
-                // Field path and failed keyword only: the message quotes the
-                // rejected value.
-                let debug = format!("{:?}", error.kind);
-                let rule = keyword_name(&debug);
-                let path = error.instance_path.to_string();
-                if path.is_empty() {
-                    format!("{rule} failed")
-                } else {
-                    format!("{path}: {rule} failed")
-                }
+                // Field path and failed rule only: the message quotes the
+                // rejected value and the path can hold caller-chosen keys.
+                let rule = rule_name(&error.kind);
+                format!(
+                    "{}: {rule} failed",
+                    render_path(&error.instance_path, &declared)
+                )
             })
             .collect::<Vec<_>>()
             .join("; "),
@@ -499,7 +662,7 @@ mod tests {
             description: Some("Execute a shell command".to_string()),
             input_schema: Some(schema),
         };
-        let validator = compile_validator(&definition).unwrap();
+        let validator = compile_validator("fake", 0, &definition).unwrap();
         pool.tools.insert(
             "shell_execute".to_string(),
             RegisteredTool {

@@ -13,12 +13,13 @@ use crate::config::LlmConfig;
 use crate::error::{CoreError, Result};
 use crate::mcp::LlmTool;
 
-const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Anthropic Claude provider.
 pub struct AnthropicProvider {
     client: reqwest::Client,
+    messages_url: String,
     api_key: String,
     model: String,
     max_tokens: u32,
@@ -38,8 +39,12 @@ impl AnthropicProvider {
             reason: "environment variable named by api_key_env is not set".to_string(),
         })?;
 
+        let base_url = config.base_url.as_deref().unwrap_or(ANTHROPIC_BASE_URL);
+        let messages_url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+
         Ok(Self {
             client: reqwest::Client::new(),
+            messages_url,
             api_key,
             model: config.model.clone(),
             max_tokens: config.max_tokens.unwrap_or(4096),
@@ -53,7 +58,7 @@ impl AnthropicProvider {
     async fn send_with_retry(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
         retry::send_json_with_retry(&self.retry_policy, "anthropic", &self.client, || {
             self.client
-                .post(ANTHROPIC_API_URL)
+                .post(&self.messages_url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("content-type", "application/json")
@@ -131,7 +136,7 @@ impl AnthropicProvider {
     ) -> Result<ChatResponse> {
         let request = self
             .client
-            .post(ANTHROPIC_API_URL)
+            .post(&self.messages_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")

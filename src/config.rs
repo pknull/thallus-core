@@ -26,17 +26,16 @@ fn default_mcp_timeout() -> u64 {
     60
 }
 
-/// `url`, `base_url`, `args` and `env` values can carry credentials, so `Debug`
-/// shows only whether they are set (and the `env` key names).
+/// Every free-text field can carry credentials, so `Debug` renders recognized
+/// selectors from a finite list and reports the rest as `<other>`, `command`
+/// and `url` as set or unset, and `args` and `env` as counts.
 impl std::fmt::Debug for McpServerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut env_keys: Vec<&String> = self.env.keys().collect();
-        env_keys.sort();
         f.debug_struct("McpServerConfig")
-            .field("transport", &self.transport)
-            .field("command", &self.command)
+            .field("transport", &known(&self.transport, &["stdio", "http"]))
+            .field("command", &Redacted(self.command.is_some()))
             .field("args", &format_args!("<{} redacted>", self.args.len()))
-            .field("env_keys", &env_keys)
+            .field("env", &format_args!("<{} redacted>", self.env.len()))
             .field("url", &Redacted(self.url.is_some()))
             .field("timeout_secs", &self.timeout_secs)
             .finish()
@@ -46,8 +45,14 @@ impl std::fmt::Debug for McpServerConfig {
 impl std::fmt::Debug for LlmConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlmConfig")
-            .field("provider", &self.provider)
-            .field("model", &self.model)
+            .field(
+                "provider",
+                &known(
+                    &self.provider,
+                    &["anthropic", "openai", "ollama", "openai-compat", "mock"],
+                ),
+            )
+            .field("model", &Redacted(true))
             .field("api_key_env", &Redacted(self.api_key_env.is_some()))
             .field("base_url", &Redacted(self.base_url.is_some()))
             .field("max_tokens", &self.max_tokens)
@@ -57,6 +62,15 @@ impl std::fmt::Debug for LlmConfig {
             .field("max_backoff_ms", &self.max_backoff_ms)
             .finish()
     }
+}
+
+/// The value if it is one of `allowed`, else `<other>`.
+fn known<'a>(value: &str, allowed: &[&'a str]) -> &'a str {
+    allowed
+        .iter()
+        .copied()
+        .find(|a| *a == value)
+        .unwrap_or("<other>")
 }
 
 /// Prints `Some(<redacted>)` or `None`.
